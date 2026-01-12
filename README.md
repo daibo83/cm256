@@ -137,7 +137,7 @@ WASM SIMD achieves ~550 MB/s encode / ~595 MB/s decode - about 7.5x faster than 
 
 ## License
 
-This implementation follows the original CM256 license. See the original repository for details.
+MIT License - see [LICENSE](LICENSE) for details.
 
 ## Credits
 
