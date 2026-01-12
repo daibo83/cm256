@@ -27,9 +27,10 @@ Benchmarks on x86_64 with `k=100` original blocks, `m=30` recovery blocks, `1296
 
 | Implementation | Encode | Decode |
 |----------------|--------|--------|
-| **Rust + NEON** | **793 MB/s** | **802 MB/s** |
-| C++ + NEON (original) | 738 MB/s | 735 MB/s |
-| Rust (scalar) | 67 MB/s | 71 MB/s |
+| **Rust + NEON** | **1351 MB/s** | **1592 MB/s** |
+| C++ + NEON (original) | 1307 MB/s | 1424 MB/s |
+| Rust + WASM SIMD | 1239 MB/s | 1234 MB/s |
+| Rust (scalar) | 131 MB/s | 142 MB/s |
 
 🏆 **Rust beats C++ on both x86 AVX2 and ARM NEON!**
 
