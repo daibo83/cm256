@@ -111,7 +111,7 @@ if [ "$ARCH" = "x86_64" ]; then
     echo "Erasure Code Comparison (CM256 vs RaptorQ vs Wirehair)"
     echo "----------------------------------------------"
     echo "(Using AVX2 for CM256 for fair comparison)"
-    RUSTFLAGS="-C target-feature=+avx2,+ssse3" cargo run --release --example compare_raptorq 2>/dev/null
+    RUSTFLAGS="-C target-feature=+avx2,+ssse3" cargo run --release --features compare --example compare_raptorq 2>/dev/null
     echo ""
 fi
 
