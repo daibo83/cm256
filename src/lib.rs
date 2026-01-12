@@ -987,32 +987,32 @@ fn gf256_mul_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
     }
 
     // Use x86 SIMD when compiled with SSSE3
-    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    #[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "ssse3"))]
     {
         unsafe { simd::gf256_mul_mem_simd(dst, src, coeff.0) };
         return;
     }
 
     // Use NEON SIMD on aarch64
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
     {
         unsafe { simd_neon::gf256_mul_mem_simd(dst, src, coeff.0) };
         return;
     }
 
     // Use WASM SIMD on wasm32
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[cfg(all(feature = "simd", target_arch = "wasm32", target_feature = "simd128"))]
     {
         unsafe { simd_wasm::gf256_mul_mem_simd(dst, src, coeff.0) };
         return;
     }
 
-    // Scalar fallback
-    #[cfg(not(any(
+    // Scalar fallback (when SIMD feature disabled or no SIMD available)
+    #[cfg(not(all(feature = "simd", any(
         all(target_arch = "x86_64", target_feature = "ssse3"),
         target_arch = "aarch64",
         all(target_arch = "wasm32", target_feature = "simd128")
-    )))]
+    ))))]
     {
         let table = MUL_TABLES.get(coeff.0);
         for i in 0..dst.len() {
@@ -1037,32 +1037,32 @@ fn gf256_muladd_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
     }
 
     // Use x86 SIMD when compiled with SSSE3
-    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    #[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "ssse3"))]
     {
         unsafe { simd::gf256_muladd_mem_simd(dst, src, coeff.0) };
         return;
     }
 
     // Use NEON SIMD on aarch64
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
     {
         unsafe { simd_neon::gf256_muladd_mem_simd(dst, src, coeff.0) };
         return;
     }
 
     // Use WASM SIMD on wasm32
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[cfg(all(feature = "simd", target_arch = "wasm32", target_feature = "simd128"))]
     {
         unsafe { simd_wasm::gf256_muladd_mem_simd(dst, src, coeff.0) };
         return;
     }
 
-    // Scalar fallback
-    #[cfg(not(any(
+    // Scalar fallback (when SIMD feature disabled or no SIMD available)
+    #[cfg(not(all(feature = "simd", any(
         all(target_arch = "x86_64", target_feature = "ssse3"),
         target_arch = "aarch64",
         all(target_arch = "wasm32", target_feature = "simd128")
-    )))]
+    ))))]
     {
         let table = MUL_TABLES.get(coeff.0);
         for i in 0..dst.len() {
@@ -1133,32 +1133,32 @@ fn gf256_mul_mem_inplace(dst: &mut [u8], coeff: Gf256) {
     }
 
     // Use x86 SIMD when compiled with SSSE3
-    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    #[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "ssse3"))]
     {
         unsafe { simd::gf256_mul_mem_inplace_simd(dst, coeff.0) };
         return;
     }
 
     // Use NEON SIMD on aarch64
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
     {
         unsafe { simd_neon::gf256_mul_mem_inplace_simd(dst, coeff.0) };
         return;
     }
 
     // Use WASM SIMD on wasm32
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[cfg(all(feature = "simd", target_arch = "wasm32", target_feature = "simd128"))]
     {
         unsafe { simd_wasm::gf256_mul_mem_inplace_simd(dst, coeff.0) };
         return;
     }
 
-    // Scalar fallback
-    #[cfg(not(any(
+    // Scalar fallback (when SIMD feature disabled or no SIMD available)
+    #[cfg(not(all(feature = "simd", any(
         all(target_arch = "x86_64", target_feature = "ssse3"),
         target_arch = "aarch64",
         all(target_arch = "wasm32", target_feature = "simd128")
-    )))]
+    ))))]
     {
         let table = MUL_TABLES.get(coeff.0);
         for i in 0..dst.len() {

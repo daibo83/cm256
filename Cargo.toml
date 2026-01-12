@@ -2,6 +2,15 @@
 name = "cm256"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+
+[features]
+default = ["simd"]
+simd = []
 
 [dependencies]
 gf256 = { path = "gf256", default-features = false }
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"

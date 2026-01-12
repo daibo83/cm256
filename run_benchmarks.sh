@@ -33,7 +33,7 @@ fi
 echo "----------------------------------------------"
 echo "Rust (scalar, no SIMD)"
 echo "----------------------------------------------"
-cargo run --release --example benchmark 2>/dev/null
+cargo run --release --no-default-features --example benchmark 2>/dev/null
 echo ""
 
 # x86_64 specific benchmarks
