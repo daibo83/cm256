@@ -11,24 +11,33 @@ echo "Architecture: $ARCH"
 echo "=============================================="
 echo ""
 
-# Build C++ if needed (only on x86_64)
-if [ "$ARCH" = "x86_64" ]; then
-    if [ ! -f "cm256/build/benchmark" ]; then
-        echo "Building C++ benchmark..."
-        mkdir -p cm256/build
-        cd cm256/build
-        cmake .. -DCMAKE_BUILD_TYPE=Release
-        make -j$(nproc)
-        cd ../..
-        echo ""
-    fi
+# Build C++ benchmark if needed
+if [ ! -f "cm256/build/benchmark" ]; then
+    echo "Building C++ benchmark..."
+    mkdir -p cm256/build
+    cd cm256/build
+    cmake .. -DCMAKE_BUILD_TYPE=Release
+    make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+    cd ../..
+    echo ""
+fi
 
+# Run C++ benchmark
+if [ "$ARCH" = "x86_64" ]; then
     echo "----------------------------------------------"
     echo "C++ + AVX2 (original, -march=native)"
     echo "----------------------------------------------"
-    ./cm256/build/benchmark
-    echo ""
+elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    echo "----------------------------------------------"
+    echo "C++ + NEON (original, -march=native)"
+    echo "----------------------------------------------"
+else
+    echo "----------------------------------------------"
+    echo "C++ (original, -march=native)"
+    echo "----------------------------------------------"
 fi
+./cm256/build/benchmark
+echo ""
 
 echo "----------------------------------------------"
 echo "Rust (scalar, no SIMD)"
