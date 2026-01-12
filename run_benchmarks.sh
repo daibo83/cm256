@@ -105,6 +105,13 @@ else
     echo ""
 fi
 
+echo "----------------------------------------------"
+echo "Erasure Code Comparison (CM256 vs RaptorQ vs Wirehair)"
+echo "----------------------------------------------"
+echo "(Using AVX2 for CM256 for fair comparison)"
+RUSTFLAGS="-C target-feature=+avx2,+ssse3" cargo run --release --example compare_raptorq 2>/dev/null
+echo ""
+
 echo "=============================================="
 echo "Benchmark complete!"
 echo "=============================================="
