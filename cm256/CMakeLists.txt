@@ -44,6 +44,9 @@ target_include_directories(cm256 PUBLIC ${PROJECT_SOURCE_DIR}/include)
 add_executable(unit_test ${UNIT_TEST_SOURCE_FILES})
 target_link_libraries(unit_test cm256)
 
+add_executable(benchmark benchmark.cpp)
+target_link_libraries(benchmark cm256)
+
 install(TARGETS cm256
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
