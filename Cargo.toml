@@ -1,0 +1,7 @@
+[package]
+name = "cm256"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gf256 = { path = "gf256", default-features = false }
