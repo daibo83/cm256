@@ -11,15 +11,27 @@ A pure Rust implementation of the CM256 Cauchy Reed-Solomon erasure coding libra
 
 ## Performance
 
-Benchmarks run on x86_64 with `k=100` original blocks, `m=30` recovery blocks, `1296` bytes/block:
+### x86_64 Benchmarks
 
-| Implementation | Encode | Decode | Build Command |
-|----------------|--------|--------|---------------|
-| **Rust + AVX2** | **1403 MB/s** | **1415 MB/s** | `RUSTFLAGS="-C target-cpu=native" cargo run --release --example benchmark` |
-| C++ + AVX2 (original) | 1283 MB/s | 1380 MB/s | `cd cm256/build && ./benchmark` (uses `-march=native`) |
-| Rust + SSE3 | 742 MB/s | 756 MB/s | `RUSTFLAGS="-C target-feature=+ssse3" cargo run --release --example benchmark` |
-| Rust + WASM SIMD | 547 MB/s | 594 MB/s | See [WASM section](#wasm-support) |
-| Rust (scalar) | 71 MB/s | 76 MB/s | `cargo run --release --example benchmark` |
+Benchmarks on x86_64 with `k=100` original blocks, `m=30` recovery blocks, `1296` bytes/block:
+
+| Implementation | Encode | Decode |
+|----------------|--------|--------|
+| **Rust + AVX2** | **1403 MB/s** | **1415 MB/s** |
+| C++ + AVX2 (original) | 1283 MB/s | 1380 MB/s |
+| Rust + SSE3 | 742 MB/s | 756 MB/s |
+| Rust + WASM SIMD | 547 MB/s | 594 MB/s |
+| Rust (scalar) | 71 MB/s | 76 MB/s |
+
+### ARM (Apple M4) Benchmarks
+
+| Implementation | Encode | Decode |
+|----------------|--------|--------|
+| **Rust + NEON** | **793 MB/s** | **802 MB/s** |
+| C++ + NEON (original) | 738 MB/s | 735 MB/s |
+| Rust (scalar) | 67 MB/s | 71 MB/s |
+
+🏆 **Rust beats C++ on both x86 AVX2 and ARM NEON!**
 
 ### Run All Benchmarks
 
