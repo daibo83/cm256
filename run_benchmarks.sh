@@ -108,8 +108,16 @@ fi
 echo "----------------------------------------------"
 echo "Erasure Code Comparison (CM256 vs RaptorQ vs Wirehair)"
 echo "----------------------------------------------"
-echo "(Using AVX2 for CM256 for fair comparison)"
-RUSTFLAGS="-C target-feature=+avx2,+ssse3" cargo run --release --example compare_raptorq 2>/dev/null
+if [ "$ARCH" = "x86_64" ]; then
+    echo "(Using AVX2 for CM256 for fair comparison)"
+    RUSTFLAGS="-C target-feature=+avx2,+ssse3" cargo run --release --example compare_raptorq 2>/dev/null
+elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    echo "(Using NEON for CM256)"
+    RUSTFLAGS="-C target-cpu=native" cargo run --release --example compare_raptorq 2>/dev/null
+else
+    echo "(Using native CPU features)"
+    cargo run --release --example compare_raptorq 2>/dev/null
+fi
 echo ""
 
 echo "=============================================="
