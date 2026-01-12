@@ -17,10 +17,11 @@ Benchmarks on x86_64 with `k=100` original blocks, `m=30` recovery blocks, `1296
 
 | Implementation | Encode | Decode |
 |----------------|--------|--------|
-| **Rust + AVX2** | **1403 MB/s** | **1415 MB/s** |
+| **Rust + AVX-512** | **1642 MB/s** | **1652 MB/s** |
+| Rust + AVX2 | 1403 MB/s | 1415 MB/s |
 | C++ + AVX2 (original) | 1283 MB/s | 1380 MB/s |
-| Rust + SSE3 | 742 MB/s | 756 MB/s |
-| Rust + WASM SIMD | 547 MB/s | 594 MB/s |
+| Rust + SSE3 | 745 MB/s | 755 MB/s |
+| Rust + WASM SIMD | 487 MB/s | 584 MB/s |
 | Rust (scalar) | 71 MB/s | 76 MB/s |
 
 ### ARM (Apple M4) Benchmarks
@@ -32,7 +33,7 @@ Benchmarks on x86_64 with `k=100` original blocks, `m=30` recovery blocks, `1296
 | Rust + WASM SIMD | 1239 MB/s | 1234 MB/s |
 | Rust (scalar) | 131 MB/s | 142 MB/s |
 
-🏆 **Rust beats C++ on both x86 AVX2 and ARM NEON!**
+🏆 **Rust beats C++ on x86 (28% faster with AVX-512) and ARM!**
 
 ### Run All Benchmarks
 
@@ -87,6 +88,7 @@ assert_eq!(decoded[0], data[0]);
 
 | Architecture | SIMD Instructions | Bytes/Iteration |
 |--------------|-------------------|-----------------|
+| x86_64 + AVX-512 | `vpshufb` (512-bit) | 256 (4x unrolled) |
 | x86_64 + AVX2 | `vpshufb` (256-bit) | 128 (4x unrolled) |
 | x86_64 + SSE3 | `pshufb` (128-bit) | 64 (4x unrolled) |
 | aarch64 (ARM) | `vtbl` (128-bit) | 64 (4x unrolled) |

@@ -54,10 +54,19 @@ if [ "$ARCH" = "x86_64" ]; then
     echo ""
 
     echo "----------------------------------------------"
-    echo "Rust + AVX2 (native CPU)"
+    echo "Rust + AVX2"
     echo "----------------------------------------------"
-    RUSTFLAGS="-C target-cpu=native" cargo run --release --example benchmark 2>/dev/null
+    RUSTFLAGS="-C target-feature=+avx2,+ssse3" cargo run --release --example benchmark 2>/dev/null
     echo ""
+
+    # Check for AVX-512 support
+    if grep -q avx512bw /proc/cpuinfo 2>/dev/null; then
+        echo "----------------------------------------------"
+        echo "Rust + AVX-512 (native CPU)"
+        echo "----------------------------------------------"
+        RUSTFLAGS="-C target-cpu=native" cargo run --release --example benchmark 2>/dev/null
+        echo ""
+    fi
 fi
 
 # ARM/aarch64 specific benchmarks
