@@ -31,13 +31,132 @@
 //! encode(&params, &blocks, &mut recovery_blocks).unwrap();
 //! ```
 
-// Define custom GF(256) type matching the C++ cm256 polynomial
-// C++ uses polynomial index 3 = 0xa6, computed as (0xa6 << 1) | 1 = 0x14d
-// Generator 0x02 works for this polynomial
-use gf256::gf::gf;
+// =============================================================================
+// GF(256) Arithmetic - Polynomial 0x14d (x^8 + x^6 + x^3 + x^2 + 1)
+// =============================================================================
 
-#[gf(polynomial = 0x14d, generator = 0x2)]
-pub type Gf256;
+/// Precomputed inverse table for GF(256)
+/// INV_TABLE[x] = x^(-1) in GF(256), with INV_TABLE[0] = 0
+struct InvTable {
+    table: [u8; 256],
+}
+
+impl InvTable {
+    /// Const-compatible GF(256) multiplication
+    const fn gf_mul(a: u8, b: u8) -> u8 {
+        let mut result = 0u16;
+        let mut aa = a as u16;
+        let mut bb = b;
+        
+        let mut i = 0;
+        while i < 8 {
+            if bb & 1 != 0 {
+                result ^= aa;
+            }
+            aa <<= 1;
+            bb >>= 1;
+            i += 1;
+        }
+        
+        let mut j = 15i32;
+        while j >= 8 {
+            if result & (1 << j) != 0 {
+                result ^= 0x14d << (j - 8);
+            }
+            j -= 1;
+        }
+        
+        result as u8
+    }
+    
+    /// Compute inverse using Fermat's little theorem: a^(-1) = a^254
+    const fn gf_inv(a: u8) -> u8 {
+        if a == 0 {
+            return 0;
+        }
+        let mut result = 1u8;
+        let mut base = a;
+        let mut exp = 254u8;
+        while exp > 0 {
+            if exp & 1 != 0 {
+                result = Self::gf_mul(result, base);
+            }
+            base = Self::gf_mul(base, base);
+            exp >>= 1;
+        }
+        result
+    }
+    
+    const fn new() -> Self {
+        let mut table = [0u8; 256];
+        let mut i = 0usize;
+        while i < 256 {
+            table[i] = Self::gf_inv(i as u8);
+            i += 1;
+        }
+        Self { table }
+    }
+}
+
+/// Precomputed inverse table
+static INV_TABLE: InvTable = InvTable::new();
+
+/// Element of GF(256) with polynomial 0x14d
+/// This is a wrapper around u8 that implements field arithmetic
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gf256(pub u8);
+
+impl Gf256 {
+    /// Const-compatible GF(256) multiplication
+    /// Polynomial: 0x14d = x^8 + x^6 + x^3 + x^2 + 1
+    const fn gf_mul_const(a: u8, b: u8) -> u8 {
+        InvTable::gf_mul(a, b)
+    }
+    
+    /// GF(256) multiplicative inverse using precomputed table
+    /// Returns 0 for input 0 (mathematically undefined but convenient)
+    #[inline]
+    pub fn inv(self) -> Self {
+        Gf256(INV_TABLE.table[self.0 as usize])
+    }
+}
+
+// GF(256) addition is XOR
+impl std::ops::Add for Gf256 {
+    type Output = Self;
+    #[inline]
+    fn add(self, other: Self) -> Self {
+        Gf256(self.0 ^ other.0)
+    }
+}
+
+// GF(256) subtraction is also XOR (same as addition)
+impl std::ops::Sub for Gf256 {
+    type Output = Self;
+    #[inline]
+    fn sub(self, other: Self) -> Self {
+        Gf256(self.0 ^ other.0)
+    }
+}
+
+// GF(256) multiplication using precomputed tables
+impl std::ops::Mul for Gf256 {
+    type Output = Self;
+    #[inline]
+    fn mul(self, other: Self) -> Self {
+        // Use forward reference to MUL_TABLES - Rust handles this fine
+        Gf256(MUL_TABLES.tables[self.0 as usize][other.0 as usize])
+    }
+}
+
+// GF(256) division: a / b = a * b^(-1)
+impl std::ops::Div for Gf256 {
+    type Output = Self;
+    #[inline]
+    fn div(self, other: Self) -> Self {
+        self * other.inv()
+    }
+}
 
 /// Error type for CM256 operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
