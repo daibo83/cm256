@@ -15,10 +15,17 @@ Benchmarks run on x86_64 with `k=100` original blocks, `m=30` recovery blocks, `
 
 | Implementation | Encode | Decode | Build Command |
 |----------------|--------|--------|---------------|
-| **Rust + AVX2** | **1368 MB/s** | **1405 MB/s** | `RUSTFLAGS="-C target-cpu=native" cargo run --release --example benchmark` |
-| C++ + AVX2 (original) | 1316 MB/s | 1435 MB/s | `cd cm256/build && ./benchmark` (uses `-march=native`) |
-| Rust + SSE3 | 737 MB/s | 764 MB/s | `RUSTFLAGS="-C target-feature=+ssse3" cargo run --release --example benchmark` |
+| **Rust + AVX2** | **1403 MB/s** | **1415 MB/s** | `RUSTFLAGS="-C target-cpu=native" cargo run --release --example benchmark` |
+| C++ + AVX2 (original) | 1283 MB/s | 1380 MB/s | `cd cm256/build && ./benchmark` (uses `-march=native`) |
+| Rust + SSE3 | 742 MB/s | 756 MB/s | `RUSTFLAGS="-C target-feature=+ssse3" cargo run --release --example benchmark` |
+| Rust + WASM SIMD | 547 MB/s | 594 MB/s | See [WASM section](#wasm-support) |
 | Rust (scalar) | 71 MB/s | 76 MB/s | `cargo run --release --example benchmark` |
+
+### Run All Benchmarks
+
+```bash
+./run_benchmarks.sh
+```
 
 ### Build for Maximum Performance
 
@@ -109,6 +116,24 @@ cargo test
 # Run benchmarks
 cargo run --release --example benchmark
 ```
+
+## WASM Support
+
+CM256 supports WebAssembly with SIMD acceleration using `i8x16_swizzle`:
+
+```bash
+# Install dependencies
+rustup target add wasm32-wasip1
+curl https://wasmtime.dev/install.sh -sSf | bash
+
+# Build with SIMD
+RUSTFLAGS="-C target-feature=+simd128" cargo build --release --target wasm32-wasip1
+
+# Run benchmark
+wasmtime --wasm simd target/wasm32-wasip1/release/examples/benchmark.wasm
+```
+
+WASM SIMD achieves ~550 MB/s encode / ~595 MB/s decode - about 7.5x faster than scalar and 74% of native SSE3 performance.
 
 ## License
 
