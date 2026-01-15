@@ -1,15 +1,19 @@
 //! Comparison benchmark: CM256 vs RaptorQ vs Wirehair
 //!
-//! Native targets (with RaptorQ/Wirehair comparison):
+//! Native targets (with Wirehair):
 //!   RUSTFLAGS="-C target-cpu=native" cargo run --release --example compare_raptorq --features compare
 //!
-//! WASM targets (CM256 only - Wirehair requires SSE4.1):
+//! WASM targets (CM256 + RaptorQ - Wirehair requires SSE4.1):
 //!   cargo run --release --example compare_raptorq --target wasm32-wasip1
 
 use std::time::Instant;
 
-#[cfg(feature = "compare")]
 fn main() {
+    run_benchmarks();
+}
+
+#[cfg(feature = "compare")]
+fn run_benchmarks() {
     // Test configurations: (k, m) pairs
     let test_configs = [
         (10, 2),
@@ -65,7 +69,7 @@ fn main() {
 }
 
 #[cfg(not(feature = "compare"))]
-fn main() {
+fn run_benchmarks() {
     // Test configurations: (k, m) pairs
     let test_configs = [
         (10, 2),
@@ -77,33 +81,39 @@ fn main() {
     let block_bytes = 1296;
 
     println!("==============================================");
-    println!("CM256 Benchmark");
+    println!("Erasure Code Comparison: CM256 vs RaptorQ");
     println!("Block size: {} bytes", block_bytes);
-    println!("For comparison with RaptorQ/Wirehair, run with:");
-    println!("  cargo run --release --example compare_raptorq --features compare");
+    println!("Note: Wirehair requires SSE4.1 and is not included");
+    println!("       (use --features compare on native targets)");
     println!("==============================================");
     println!();
 
     // Print table header
-    println!("{:<12} {:>12}", "Config (k,m)", "CM256");
-    println!("{:<12} {:>12}", "", "(MB/s)");
-    println!("{}", "-".repeat(28));
+    println!("{:<12} {:>12} {:>12}", "Config (k,m)", "CM256", "RaptorQ");
+    println!("{:<12} {:>12} {:>12}", "", "(MB/s)", "(MB/s)");
+    println!("{}", "-".repeat(40));
 
     // Run benchmarks for each configuration
     for (original_count, recovery_count) in test_configs {
+        let data_size = original_count * block_bytes;
+
         // Benchmark CM256
         let cm256_speed = benchmark_cm256(original_count, recovery_count, block_bytes);
 
+        // Benchmark RaptorQ
+        let raptorq_speed = benchmark_raptorq(data_size, block_bytes as u16, recovery_count);
+
         // Print results in table row
         println!(
-            "k={:<3}, m={:<3} {:>12.2}",
-            original_count, recovery_count, cm256_speed
+            "k={:<3}, m={:<3} {:>12.2} {:>12.2}",
+            original_count, recovery_count, cm256_speed, raptorq_speed
         );
     }
 
     println!();
     println!("=== Summary ===");
     println!("CM256: O(k²) decode, O(k×m) encode - systematic Reed-Solomon");
+    println!("RaptorQ: O(n) encode/decode - fountain code (unlimited recovery)");
 }
 
 fn benchmark_cm256(original_count: usize, recovery_count: usize, block_bytes: usize) -> f64 {
@@ -149,7 +159,6 @@ fn benchmark_cm256(original_count: usize, recovery_count: usize, block_bytes: us
     encode_throughput
 }
 
-#[cfg(feature = "compare")]
 fn benchmark_raptorq(data_size: usize, symbol_size: u16, repair_count: usize) -> f64 {
     use raptorq::{Encoder, ObjectTransmissionInformation};
 
