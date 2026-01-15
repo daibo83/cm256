@@ -1,38 +1,117 @@
 //! Comparison benchmark: CM256 vs RaptorQ vs Wirehair
 //!
-//! Run with: RUSTFLAGS="-C target-cpu=native" cargo run --release --example compare_raptorq
+//! Native targets (with RaptorQ/Wirehair comparison):
+//!   RUSTFLAGS="-C target-cpu=native" cargo run --release --example compare_raptorq --features compare
+//!
+//! WASM targets (CM256 only - Wirehair requires SSE4.1):
+//!   cargo run --release --example compare_raptorq --target wasm32-wasip1
 
 use std::time::Instant;
 
+#[cfg(feature = "compare")]
 fn main() {
-    // Test parameters
-    let original_count = 100;
-    let recovery_count = 30;
+    // Test configurations: (k, m) pairs
+    let test_configs = [
+        (10, 2),
+        (20, 4),
+        (50, 10),
+        (100, 20),
+        (100, 30), // Original configuration for backward compatibility
+    ];
     let block_bytes = 1296;
-    let data_size = original_count * block_bytes;
-    
+
     println!("==============================================");
     println!("Erasure Code Comparison: CM256 vs RaptorQ vs Wirehair");
-    println!("Data size: {} bytes, Block size: {} bytes", data_size, block_bytes);
+    println!("Block size: {} bytes", block_bytes);
     println!("==============================================");
     println!();
-    
-    // Benchmark CM256
-    benchmark_cm256(original_count, recovery_count, block_bytes);
-    
-    // Benchmark RaptorQ
-    benchmark_raptorq(data_size, block_bytes as u16, recovery_count);
-    
-    // Benchmark Wirehair
-    benchmark_wirehair(data_size, block_bytes, recovery_count);
+
+    // Print table header
+    println!(
+        "{:<12} {:>12} {:>12} {:>12}",
+        "Config (k,m)", "CM256", "RaptorQ", "Wirehair"
+    );
+    println!(
+        "{:<12} {:>12} {:>12} {:>12}",
+        "", "(MB/s)", "(MB/s)", "(MB/s)"
+    );
+    println!("{}", "-".repeat(52));
+
+    // Run benchmarks for each configuration
+    for (original_count, recovery_count) in test_configs {
+        let data_size = original_count * block_bytes;
+
+        // Benchmark CM256
+        let cm256_speed = benchmark_cm256(original_count, recovery_count, block_bytes);
+
+        // Benchmark RaptorQ
+        let raptorq_speed = benchmark_raptorq(data_size, block_bytes as u16, recovery_count);
+
+        // Benchmark Wirehair
+        let wirehair_speed = benchmark_wirehair(data_size, block_bytes, recovery_count);
+
+        // Print results in table row
+        println!(
+            "k={:<3}, m={:<3} {:>12.2} {:>12.2} {:>12.2}",
+            original_count, recovery_count, cm256_speed, raptorq_speed, wirehair_speed
+        );
+    }
+
+    println!();
+    println!("=== Summary ===");
+    println!("CM256: O(k²) decode, O(k×m) encode - systematic Reed-Solomon");
+    println!("RaptorQ: O(n) encode/decode - fountain code (unlimited recovery)");
+    println!("Wirehair: O(n) encode/decode - fountain code (fast)");
 }
 
-fn benchmark_cm256(original_count: usize, recovery_count: usize, block_bytes: usize) {
-    use cm256::{Block, Params, encode};
-    
+#[cfg(not(feature = "compare"))]
+fn main() {
+    // Test configurations: (k, m) pairs
+    let test_configs = [
+        (10, 2),
+        (20, 4),
+        (50, 10),
+        (100, 20),
+        (100, 30), // Original configuration for backward compatibility
+    ];
+    let block_bytes = 1296;
+
+    println!("==============================================");
+    println!("CM256 Benchmark");
+    println!("Block size: {} bytes", block_bytes);
+    println!("For comparison with RaptorQ/Wirehair, run with:");
+    println!("  cargo run --release --example compare_raptorq --features compare");
+    println!("==============================================");
+    println!();
+
+    // Print table header
+    println!("{:<12} {:>12}", "Config (k,m)", "CM256");
+    println!("{:<12} {:>12}", "", "(MB/s)");
+    println!("{}", "-".repeat(28));
+
+    // Run benchmarks for each configuration
+    for (original_count, recovery_count) in test_configs {
+        // Benchmark CM256
+        let cm256_speed = benchmark_cm256(original_count, recovery_count, block_bytes);
+
+        // Print results in table row
+        println!(
+            "k={:<3}, m={:<3} {:>12.2}",
+            original_count, recovery_count, cm256_speed
+        );
+    }
+
+    println!();
+    println!("=== Summary ===");
+    println!("CM256: O(k²) decode, O(k×m) encode - systematic Reed-Solomon");
+}
+
+fn benchmark_cm256(original_count: usize, recovery_count: usize, block_bytes: usize) -> f64 {
+    use cm256::{encode, Block, Params};
+
     let params = Params::new(original_count, recovery_count, block_bytes).unwrap();
     let data_size = original_count * block_bytes;
-    
+
     // Create original data
     let orig_data: Vec<Vec<u8>> = (0..original_count)
         .map(|i| {
@@ -41,9 +120,9 @@ fn benchmark_cm256(original_count: usize, recovery_count: usize, block_bytes: us
                 .collect()
         })
         .collect();
-    
+
     let mut recovery_data = vec![0u8; recovery_count * block_bytes];
-    
+
     // Warm up
     let blocks: Vec<Block> = orig_data
         .iter()
@@ -51,7 +130,7 @@ fn benchmark_cm256(original_count: usize, recovery_count: usize, block_bytes: us
         .map(|(i, data)| Block::new(i as u8, data))
         .collect();
     encode(&params, &blocks, &mut recovery_data).unwrap();
-    
+
     // Benchmark encode
     let iterations = 1000;
     let start = Instant::now();
@@ -64,27 +143,26 @@ fn benchmark_cm256(original_count: usize, recovery_count: usize, block_bytes: us
         encode(&params, &blocks, &mut recovery_data).unwrap();
     }
     let encode_time = start.elapsed();
-    let encode_throughput = (data_size * iterations) as f64 / encode_time.as_secs_f64() / 1_000_000.0;
-    
-    println!("CM256 (Cauchy Reed-Solomon)");
-    println!("  k={}, m={}, {} bytes/block", original_count, recovery_count, block_bytes);
-    println!("  Encode: {:.2} MB/s", encode_throughput);
-    println!();
+    let encode_throughput =
+        (data_size * iterations) as f64 / encode_time.as_secs_f64() / 1_000_000.0;
+
+    encode_throughput
 }
 
-fn benchmark_raptorq(data_size: usize, symbol_size: u16, repair_count: usize) {
+#[cfg(feature = "compare")]
+fn benchmark_raptorq(data_size: usize, symbol_size: u16, repair_count: usize) -> f64 {
     use raptorq::{Encoder, ObjectTransmissionInformation};
-    
+
     // Create test data
     let data: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
-    
+
     // RaptorQ config
     let config = ObjectTransmissionInformation::new(data_size as u64, symbol_size, 1, 1, 8);
-    
+
     // Warm up
     let encoder = Encoder::new(&data, config);
     let _packets: Vec<_> = encoder.get_encoded_packets(repair_count as u32);
-    
+
     // Benchmark encode
     let iterations = 1000;
     let start = Instant::now();
@@ -93,24 +171,22 @@ fn benchmark_raptorq(data_size: usize, symbol_size: u16, repair_count: usize) {
         let _packets: Vec<_> = encoder.get_encoded_packets(repair_count as u32);
     }
     let encode_time = start.elapsed();
-    let encode_throughput = (data_size * iterations) as f64 / encode_time.as_secs_f64() / 1_000_000.0;
-    
-    let num_source = (data_size + symbol_size as usize - 1) / symbol_size as usize;
-    println!("RaptorQ (RFC 6330 Fountain Code)");
-    println!("  {} source symbols, {} bytes/symbol", num_source, symbol_size);
-    println!("  Encode: {:.2} MB/s", encode_throughput);
-    println!();
+    let encode_throughput =
+        (data_size * iterations) as f64 / encode_time.as_secs_f64() / 1_000_000.0;
+
+    encode_throughput
 }
 
-fn benchmark_wirehair(data_size: usize, block_bytes: usize, recovery_count: usize) {
-    use wirehair_wrapper::wirehair::{WirehairEncoder, wirehair_init};
-    
+#[cfg(feature = "compare")]
+fn benchmark_wirehair(data_size: usize, block_bytes: usize, recovery_count: usize) -> f64 {
+    use wirehair_wrapper::wirehair::{wirehair_init, WirehairEncoder};
+
     // Initialize wirehair library
     wirehair_init().expect("Failed to init wirehair");
-    
+
     // Create test data
     let data: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
-    
+
     // Warm up
     let encoder = WirehairEncoder::new(&data, data_size as u64, block_bytes as u32);
     let mut block = vec![0u8; block_bytes];
@@ -118,7 +194,7 @@ fn benchmark_wirehair(data_size: usize, block_bytes: usize, recovery_count: usiz
     for i in 0..recovery_count as u64 {
         let _ = encoder.encode(i, &mut block, block_bytes as u32, &mut out_bytes);
     }
-    
+
     // Benchmark encode
     let iterations = 1000;
     let start = Instant::now();
@@ -129,11 +205,8 @@ fn benchmark_wirehair(data_size: usize, block_bytes: usize, recovery_count: usiz
         }
     }
     let encode_time = start.elapsed();
-    let encode_throughput = (data_size * iterations) as f64 / encode_time.as_secs_f64() / 1_000_000.0;
-    
-    let num_blocks = (data_size + block_bytes - 1) / block_bytes;
-    println!("Wirehair (Fountain Code)");
-    println!("  {} blocks, {} bytes/block", num_blocks, block_bytes);
-    println!("  Encode: {:.2} MB/s", encode_throughput);
-    println!();
+    let encode_throughput =
+        (data_size * iterations) as f64 / encode_time.as_secs_f64() / 1_000_000.0;
+
+    encode_throughput
 }
