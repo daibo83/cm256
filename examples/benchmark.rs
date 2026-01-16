@@ -1,6 +1,6 @@
 //! Benchmarks for CM256 encoder/decoder
 
-use cm256::{Block, BlockMut, Params, decode, encode};
+use cm256::{decode, encode, Block, BlockMut, Params};
 use std::time::Instant;
 
 fn main() {
