@@ -7,7 +7,12 @@
 //! `recovery_count` recovery blocks, and recover any `original_count`
 //! blocks from any combination of original and recovery blocks.
 //!
-//! # Example
+//! # Modules
+//!
+//! - **Block FEC**: The main API (`encode`, `decode`) for traditional block-based erasure coding
+//! - **[`streaming`]**: Diagonal interleaving for low-latency real-time streaming
+//!
+//! # Example (Block FEC)
 //!
 //! ```rust
 //! use cm256::{Params, Block, encode, decode};
@@ -30,6 +35,23 @@
 //!     .collect();
 //! encode(&params, &blocks, &mut recovery_blocks).unwrap();
 //! ```
+//!
+//! # Example (Streaming FEC)
+//!
+//! ```rust
+//! use cm256::streaming::{StreamingEncoder, StreamingDecoder, StreamingParams};
+//!
+//! // delay=8 symbols, 2 parities, 1200 bytes per symbol
+//! let params = StreamingParams::new(8, 2, 1200).unwrap();
+//! let mut encoder = StreamingEncoder::new(params);
+//!
+//! // Add source symbols; parities are generated when window is full
+//! let data = vec![0x42u8; 1200];
+//! let result = encoder.add_source(&data);
+//! // result.parities contains generated parity symbols
+//! ```
+
+pub mod streaming;
 
 // =============================================================================
 // GF(256) Arithmetic - Polynomial 0x14d (x^8 + x^6 + x^3 + x^2 + 1)
@@ -1422,7 +1444,7 @@ fn has_ssse3() -> bool {
 /// dst[i] = src[i] * coeff
 /// Using SIMD when available, otherwise lookup table
 #[inline]
-fn gf256_mul_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
+pub(crate) fn gf256_mul_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
     debug_assert_eq!(dst.len(), src.len());
 
     if coeff.0 == 0 {
@@ -1475,7 +1497,7 @@ fn gf256_mul_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
 /// dst[i] += src[i] * coeff (where + is XOR)
 /// Using SIMD when available, otherwise lookup table
 #[inline]
-fn gf256_muladd_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
+pub(crate) fn gf256_muladd_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
     debug_assert_eq!(dst.len(), src.len());
 
     if coeff.0 == 0 {
@@ -1555,7 +1577,7 @@ fn gf256_add_mem(dst: &mut [u8], src1: &[u8], src2: &[u8]) {
 /// dst[i] ^= src[i]
 /// Optimized with wide operations
 #[inline]
-fn gf256_xor_mem(dst: &mut [u8], src: &[u8]) {
+pub(crate) fn gf256_xor_mem(dst: &mut [u8], src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
 
     let len = dst.len();
@@ -1577,7 +1599,7 @@ fn gf256_xor_mem(dst: &mut [u8], src: &[u8]) {
 /// dst[i] = dst[i] * coeff (in-place multiplication)
 /// Using SIMD when available, otherwise lookup table
 #[inline]
-fn gf256_mul_mem_inplace(dst: &mut [u8], coeff: Gf256) {
+pub(crate) fn gf256_mul_mem_inplace(dst: &mut [u8], coeff: Gf256) {
     if coeff.0 == 0 {
         dst.fill(0);
         return;
@@ -1855,7 +1877,6 @@ impl<'a> Decoder<'a> {
 
         (matrix_l, diag_d, matrix_u)
     }
-
 
     /// Decode for m>1 case using LDU decomposition
     fn decode(&mut self) {
@@ -2285,44 +2306,50 @@ mod tests {
 #[test]
 fn test_five_erasures() {
     let params = Params::new(7, 5, 50).unwrap();
-    
+
     // Create original data (7 blocks of 50 bytes each)
     let orig: Vec<Vec<u8>> = (0..7)
         .map(|i| (0..50).map(|j| ((i * 50 + j) % 256) as u8).collect())
         .collect();
-    
+
     // Encode
-    let blocks: Vec<Block> = orig.iter().enumerate()
+    let blocks: Vec<Block> = orig
+        .iter()
+        .enumerate()
         .map(|(i, data)| Block::new(i as u8, data))
         .collect();
-    
+
     let mut recovery = vec![0u8; 5 * 50]; // 5 parity blocks
     encode(&params, &blocks, &mut recovery).unwrap();
-    
+
     // Store parity blocks
     let mut parity0 = recovery[0..50].to_vec();
     let mut parity1 = recovery[50..100].to_vec();
     let mut parity2 = recovery[100..150].to_vec();
     let mut parity3 = recovery[150..200].to_vec();
     let mut parity4 = recovery[200..250].to_vec();
-    
+
     // Simulate losing blocks 0-4, keep blocks 5, 6 and all parity
     let mut block5 = orig[5].clone();
     let mut block6 = orig[6].clone();
-    
+
     let mut decode_blocks = vec![
         BlockMut::new(5, &mut block5),
         BlockMut::new(6, &mut block6),
-        BlockMut::new(7, &mut parity0),  // recovery 0 has index 7 (data_count + 0)
-        BlockMut::new(8, &mut parity1),  // recovery 1 has index 8
-        BlockMut::new(9, &mut parity2),  // recovery 2 has index 9
+        BlockMut::new(7, &mut parity0), // recovery 0 has index 7 (data_count + 0)
+        BlockMut::new(8, &mut parity1), // recovery 1 has index 8
+        BlockMut::new(9, &mut parity2), // recovery 2 has index 9
         BlockMut::new(10, &mut parity3), // recovery 3 has index 10
         BlockMut::new(11, &mut parity4), // recovery 4 has index 11
     ];
-    
+
     let recovered_indices = decode(&params, &mut decode_blocks).unwrap();
-    assert_eq!(recovered_indices, vec![0, 1, 2, 3, 4], "Should recover blocks 0-4");
-    
+    assert_eq!(
+        recovered_indices,
+        vec![0, 1, 2, 3, 4],
+        "Should recover blocks 0-4"
+    );
+
     // The parity blocks now contain the recovered data in order of missing indices
     assert_eq!(parity0, orig[0], "parity0 should now contain block 0");
     assert_eq!(parity1, orig[1], "parity1 should now contain block 1");
@@ -2334,26 +2361,28 @@ fn test_five_erasures() {
 #[test]
 fn test_three_erasures() {
     let params = Params::new(5, 3, 50).unwrap();
-    
+
     let orig: Vec<Vec<u8>> = (0..5)
         .map(|i| (0..50).map(|j| ((i * 50 + j) % 256) as u8).collect())
         .collect();
-    
-    let blocks: Vec<Block> = orig.iter().enumerate()
+
+    let blocks: Vec<Block> = orig
+        .iter()
+        .enumerate()
         .map(|(i, data)| Block::new(i as u8, data))
         .collect();
-    
+
     let mut recovery = vec![0u8; 3 * 50];
     encode(&params, &blocks, &mut recovery).unwrap();
-    
+
     let mut parity0 = recovery[0..50].to_vec();
     let mut parity1 = recovery[50..100].to_vec();
     let mut parity2 = recovery[100..150].to_vec();
-    
+
     // Keep blocks 3, 4 and all parity. Lose blocks 0, 1, 2
     let mut block3 = orig[3].clone();
     let mut block4 = orig[4].clone();
-    
+
     let mut decode_blocks = vec![
         BlockMut::new(3, &mut block3),
         BlockMut::new(4, &mut block4),
@@ -2361,10 +2390,14 @@ fn test_three_erasures() {
         BlockMut::new(6, &mut parity1),
         BlockMut::new(7, &mut parity2),
     ];
-    
+
     let recovered_indices = decode(&params, &mut decode_blocks).unwrap();
-    assert_eq!(recovered_indices, vec![0, 1, 2], "Should recover blocks 0-2");
-    
+    assert_eq!(
+        recovered_indices,
+        vec![0, 1, 2],
+        "Should recover blocks 0-2"
+    );
+
     assert_eq!(parity0, orig[0], "parity0 should now contain block 0");
     assert_eq!(parity1, orig[1], "parity1 should now contain block 1");
     assert_eq!(parity2, orig[2], "parity2 should now contain block 2");
@@ -2374,27 +2407,29 @@ fn test_three_erasures() {
 #[test]
 fn test_two_erasures_with_verification() {
     let params = Params::new(5, 3, 32).unwrap();
-    
+
     // Create distinct original data
     let orig: Vec<Vec<u8>> = (0..5)
         .map(|i| (0..32).map(|j| ((i * 32 + j) % 256) as u8).collect())
         .collect();
-    
-    let blocks: Vec<Block> = orig.iter().enumerate()
+
+    let blocks: Vec<Block> = orig
+        .iter()
+        .enumerate()
         .map(|(i, data)| Block::new(i as u8, data))
         .collect();
-    
+
     // Encode
     let mut recovery = vec![0u8; 3 * 32];
     encode(&params, &blocks, &mut recovery).unwrap();
-    
+
     // Test: lose blocks 0 and 3, use recovery blocks 0 and 1
     let mut rec0 = recovery[..32].to_vec();
     let mut rec1 = recovery[32..64].to_vec();
     let mut block1_data = orig[1].clone();
     let mut block2_data = orig[2].clone();
     let mut block4_data = orig[4].clone();
-    
+
     let mut decode_blocks = vec![
         BlockMut::new(5, &mut rec0), // recovery block 0
         BlockMut::new(1, &mut block1_data),
@@ -2402,21 +2437,21 @@ fn test_two_erasures_with_verification() {
         BlockMut::new(6, &mut rec1), // recovery block 1
         BlockMut::new(4, &mut block4_data),
     ];
-    
+
     let recovered = decode(&params, &mut decode_blocks).unwrap();
-    
+
     // Should have recovered blocks 0 and 3
     assert_eq!(recovered.len(), 2);
     assert!(recovered.contains(&0));
     assert!(recovered.contains(&3));
-    
+
     // VERIFY the actual recovered data!
     // Based on erasure order [0, 3], rec0 should have block 0, rec1 should have block 3
     println!("rec0 first 8 bytes: {:?}", &rec0[..8]);
     println!("orig[0] first 8 bytes: {:?}", &orig[0][..8]);
     println!("rec1 first 8 bytes: {:?}", &rec1[..8]);
     println!("orig[3] first 8 bytes: {:?}", &orig[3][..8]);
-    
+
     assert_eq!(rec0, orig[0], "rec0 should contain block 0");
     assert_eq!(rec1, orig[3], "rec1 should contain block 3");
 }
@@ -2425,24 +2460,26 @@ fn test_two_erasures_with_verification() {
 fn test_two_consecutive_erasures() {
     // Lose blocks 0 and 1, keep 2, 3, 4
     let params = Params::new(5, 3, 32).unwrap();
-    
+
     let orig: Vec<Vec<u8>> = (0..5)
         .map(|i| (0..32).map(|j| ((i * 32 + j) % 256) as u8).collect())
         .collect();
-    
-    let blocks: Vec<Block> = orig.iter().enumerate()
+
+    let blocks: Vec<Block> = orig
+        .iter()
+        .enumerate()
         .map(|(i, data)| Block::new(i as u8, data))
         .collect();
-    
+
     let mut recovery = vec![0u8; 3 * 32];
     encode(&params, &blocks, &mut recovery).unwrap();
-    
+
     let mut rec0 = recovery[..32].to_vec();
     let mut rec1 = recovery[32..64].to_vec();
     let mut block2_data = orig[2].clone();
     let mut block3_data = orig[3].clone();
     let mut block4_data = orig[4].clone();
-    
+
     let mut decode_blocks = vec![
         BlockMut::new(5, &mut rec0),
         BlockMut::new(6, &mut rec1),
@@ -2450,13 +2487,21 @@ fn test_two_consecutive_erasures() {
         BlockMut::new(3, &mut block3_data),
         BlockMut::new(4, &mut block4_data),
     ];
-    
+
     let recovered = decode(&params, &mut decode_blocks).unwrap();
-    
+
     println!("Recovered indices: {:?}", recovered);
-    println!("rec0 first 8: {:?}, orig[0] first 8: {:?}", &rec0[..8], &orig[0][..8]);
-    println!("rec1 first 8: {:?}, orig[1] first 8: {:?}", &rec1[..8], &orig[1][..8]);
-    
+    println!(
+        "rec0 first 8: {:?}, orig[0] first 8: {:?}",
+        &rec0[..8],
+        &orig[0][..8]
+    );
+    println!(
+        "rec1 first 8: {:?}, orig[1] first 8: {:?}",
+        &rec1[..8],
+        &orig[1][..8]
+    );
+
     assert_eq!(rec0, orig[0], "rec0 should contain block 0");
     assert_eq!(rec1, orig[1], "rec1 should contain block 1");
 }
@@ -2465,39 +2510,53 @@ fn test_two_consecutive_erasures() {
 fn test_three_consecutive_erasures() {
     // Lose blocks 0, 1, 2 - keep 3, 4
     let params = Params::new(5, 3, 32).unwrap();
-    
+
     let orig: Vec<Vec<u8>> = (0..5)
         .map(|i| (0..32).map(|j| ((i * 32 + j) % 256) as u8).collect())
         .collect();
-    
-    let blocks: Vec<Block> = orig.iter().enumerate()
+
+    let blocks: Vec<Block> = orig
+        .iter()
+        .enumerate()
         .map(|(i, data)| Block::new(i as u8, data))
         .collect();
-    
+
     let mut recovery = vec![0u8; 3 * 32];
     encode(&params, &blocks, &mut recovery).unwrap();
-    
+
     let mut rec0 = recovery[..32].to_vec();
     let mut rec1 = recovery[32..64].to_vec();
     let mut rec2 = recovery[64..96].to_vec();
     let mut block3_data = orig[3].clone();
     let mut block4_data = orig[4].clone();
-    
+
     let mut decode_blocks = vec![
-        BlockMut::new(5, &mut rec0),  // recovery 0
-        BlockMut::new(6, &mut rec1),  // recovery 1
-        BlockMut::new(7, &mut rec2),  // recovery 2
+        BlockMut::new(5, &mut rec0), // recovery 0
+        BlockMut::new(6, &mut rec1), // recovery 1
+        BlockMut::new(7, &mut rec2), // recovery 2
         BlockMut::new(3, &mut block3_data),
         BlockMut::new(4, &mut block4_data),
     ];
-    
+
     let recovered = decode(&params, &mut decode_blocks).unwrap();
-    
+
     println!("Recovered indices: {:?}", recovered);
-    println!("rec0 first 8: {:?}, orig[0] first 8: {:?}", &rec0[..8], &orig[0][..8]);
-    println!("rec1 first 8: {:?}, orig[1] first 8: {:?}", &rec1[..8], &orig[1][..8]);
-    println!("rec2 first 8: {:?}, orig[2] first 8: {:?}", &rec2[..8], &orig[2][..8]);
-    
+    println!(
+        "rec0 first 8: {:?}, orig[0] first 8: {:?}",
+        &rec0[..8],
+        &orig[0][..8]
+    );
+    println!(
+        "rec1 first 8: {:?}, orig[1] first 8: {:?}",
+        &rec1[..8],
+        &orig[1][..8]
+    );
+    println!(
+        "rec2 first 8: {:?}, orig[2] first 8: {:?}",
+        &rec2[..8],
+        &orig[2][..8]
+    );
+
     assert_eq!(rec0, orig[0], "rec0 should contain block 0");
     assert_eq!(rec1, orig[1], "rec1 should contain block 1");
     assert_eq!(rec2, orig[2], "rec2 should contain block 2");
@@ -2507,25 +2566,27 @@ fn test_three_consecutive_erasures() {
 fn test_four_erasures() {
     // 6 data blocks, 4 parity - lose blocks 0, 1, 2, 3
     let params = Params::new(6, 4, 32).unwrap();
-    
+
     let orig: Vec<Vec<u8>> = (0..6)
         .map(|i| (0..32).map(|j| ((i * 32 + j) % 256) as u8).collect())
         .collect();
-    
-    let blocks: Vec<Block> = orig.iter().enumerate()
+
+    let blocks: Vec<Block> = orig
+        .iter()
+        .enumerate()
         .map(|(i, data)| Block::new(i as u8, data))
         .collect();
-    
+
     let mut recovery = vec![0u8; 4 * 32];
     encode(&params, &blocks, &mut recovery).unwrap();
-    
+
     let mut rec0 = recovery[..32].to_vec();
     let mut rec1 = recovery[32..64].to_vec();
     let mut rec2 = recovery[64..96].to_vec();
     let mut rec3 = recovery[96..128].to_vec();
     let mut block4_data = orig[4].clone();
     let mut block5_data = orig[5].clone();
-    
+
     let mut decode_blocks = vec![
         BlockMut::new(6, &mut rec0),
         BlockMut::new(7, &mut rec1),
@@ -2534,12 +2595,16 @@ fn test_four_erasures() {
         BlockMut::new(4, &mut block4_data),
         BlockMut::new(5, &mut block5_data),
     ];
-    
+
     let recovered = decode(&params, &mut decode_blocks).unwrap();
-    
+
     println!("Recovered indices: {:?}", recovered);
-    println!("rec0 first 8: {:?}, orig[0] first 8: {:?}", &rec0[..8], &orig[0][..8]);
-    
+    println!(
+        "rec0 first 8: {:?}, orig[0] first 8: {:?}",
+        &rec0[..8],
+        &orig[0][..8]
+    );
+
     assert_eq!(rec0, orig[0], "rec0 should contain block 0");
     assert_eq!(rec1, orig[1], "rec1 should contain block 1");
     assert_eq!(rec2, orig[2], "rec2 should contain block 2");
