@@ -127,9 +127,9 @@ struct Args {
 enum Command {
     /// Send H.264 from stdin over network with streaming FEC
     Send {
-        /// Local bind address
+        /// Local address to bind to
         #[arg(short, long, default_value = "0.0.0.0:9000")]
-        addr: SocketAddr,
+        listen: SocketAddr,
 
         /// Remote address to send to
         #[arg(short, long, default_value = "127.0.0.1:9001")]
@@ -149,9 +149,9 @@ enum Command {
     },
     /// Receive stream and output H.264 to stdout
     Recv {
-        /// Local bind address
+        /// Local address to bind to
         #[arg(short, long, default_value = "0.0.0.0:9001")]
-        addr: SocketAddr,
+        listen: SocketAddr,
 
         /// FEC delay (must match sender)
         #[arg(long, default_value = "8")]
@@ -507,18 +507,18 @@ async fn main() -> Result<()> {
 
     match args.command {
         Command::Send {
-            addr,
+            listen,
             remote,
             delay,
             parities,
             packet_size,
-        } => run_sender(addr, remote, delay, parities, packet_size).await?,
+        } => run_sender(listen, remote, delay, parities, packet_size).await?,
         Command::Recv {
-            addr,
+            listen,
             delay,
             parities,
             packet_size,
-        } => run_receiver(addr, delay, parities, packet_size).await?,
+        } => run_receiver(listen, delay, parities, packet_size).await?,
     }
 
     Ok(())
