@@ -52,13 +52,14 @@ use crate::{gf256_mul_mem_inplace, gf256_muladd_mem, Error, Gf256};
 /// Parameters for streaming FEC encoding/decoding.
 ///
 /// The streaming code uses a sliding window of `delay` source symbols.
-/// For each complete window, `num_parities` parity symbols are generated.
+/// Parity symbols are generated every `step_size` source symbols.
 ///
 /// # Properties
 ///
 /// - **Burst tolerance**: Can recover from loss of up to `num_parities` consecutive symbols
-/// - **Overhead**: `num_parities / delay` (e.g., 2/8 = 25%)
+/// - **Overhead**: `num_parities / step_size` (e.g., 3/5 = 60%)
 /// - **Latency**: Decoding requires waiting for the full window
+/// - **Overlap**: Each packet is covered by `delay / step_size` parity groups
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamingParams {
     /// Number of source symbols covered by each parity (span/delay).
@@ -68,6 +69,10 @@ pub struct StreamingParams {
     /// Number of parity symbols generated per window.
     /// Range: 1..=(256 - delay).
     num_parities: u8,
+
+    /// How often to generate parity (every step_size source symbols).
+    /// Range: 1..=delay. Lower = more overlap, higher overhead.
+    step_size: u8,
 
     /// Size of each symbol in bytes.
     symbol_bytes: usize,
@@ -82,12 +87,41 @@ impl StreamingParams {
     /// * `num_parities` - Number of parity symbols per window (1..=(256-delay))
     /// * `symbol_bytes` - Size of each symbol in bytes (> 0)
     ///
+    /// Uses `step_size = delay` by default (block-like behavior, lowest overhead).
+    /// Use `with_step_size()` for more frequent parity generation.
+    ///
     /// # Errors
     ///
     /// Returns `Error::InvalidParams` if parameters are out of range.
     /// Returns `Error::TooManyBlocks` if delay + num_parities > 256.
     pub fn new(delay: u8, num_parities: u8, symbol_bytes: usize) -> Result<Self, Error> {
+        Self::with_step_size(delay, num_parities, delay, symbol_bytes)
+    }
+
+    /// Create new streaming parameters with custom step size.
+    ///
+    /// # Arguments
+    ///
+    /// * `delay` - Number of source symbols each parity covers (2..=255)
+    /// * `num_parities` - Number of parity symbols per window (1..=(256-delay))
+    /// * `step_size` - Generate parities every N source symbols (1..=delay)
+    /// * `symbol_bytes` - Size of each symbol in bytes (> 0)
+    ///
+    /// # Overhead Calculation
+    ///
+    /// - `step_size = delay`: Overhead = `num_parities / delay` (e.g., 3/15 = 20%)
+    /// - `step_size = 1`: Overhead = `num_parities` per source (e.g., 3 = 300%)
+    /// - `step_size = 5`: Overhead = `num_parities / 5` (e.g., 3/5 = 60%)
+    pub fn with_step_size(
+        delay: u8,
+        num_parities: u8,
+        step_size: u8,
+        symbol_bytes: usize,
+    ) -> Result<Self, Error> {
         if delay < 2 || num_parities == 0 || symbol_bytes == 0 {
+            return Err(Error::InvalidParams);
+        }
+        if step_size == 0 || step_size > delay {
             return Err(Error::InvalidParams);
         }
         if (delay as usize) + (num_parities as usize) > 256 {
@@ -96,6 +130,7 @@ impl StreamingParams {
         Ok(Self {
             delay,
             num_parities,
+            step_size,
             symbol_bytes,
         })
     }
@@ -110,6 +145,12 @@ impl StreamingParams {
     #[inline]
     pub fn num_parities(&self) -> u8 {
         self.num_parities
+    }
+
+    /// Get the step size.
+    #[inline]
+    pub fn step_size(&self) -> u8 {
+        self.step_size
     }
 
     /// Get the symbol size in bytes.
@@ -127,7 +168,7 @@ impl StreamingParams {
     /// Overhead ratio (parity bytes / source bytes).
     #[inline]
     pub fn overhead(&self) -> f32 {
-        self.num_parities as f32 / self.delay as f32
+        self.num_parities as f32 / self.step_size as f32
     }
 }
 
@@ -180,7 +221,7 @@ pub struct ParityOutput {
 /// Streaming FEC encoder using diagonal interleaving.
 ///
 /// The encoder maintains a sliding window of recent source symbols and
-/// generates parity symbols as the window advances.
+/// generates parity symbols every `step_size` packets as the window advances.
 #[derive(Debug)]
 pub struct StreamingEncoder {
     params: StreamingParams,
@@ -190,6 +231,9 @@ pub struct StreamingEncoder {
 
     /// Next sequence number to assign.
     next_seq: u16,
+
+    /// Counter for step_size tracking.
+    packets_since_parity: u8,
 }
 
 impl StreamingEncoder {
@@ -199,6 +243,7 @@ impl StreamingEncoder {
             params,
             buffer: VecDeque::with_capacity(params.delay as usize),
             next_seq: 0,
+            packets_since_parity: 0,
         }
     }
 
@@ -215,7 +260,7 @@ impl StreamingEncoder {
     /// Add a source symbol to the encoder.
     ///
     /// Returns the assigned sequence number and any generated parity symbols.
-    /// Parity symbols are generated when the window becomes full.
+    /// Parity symbols are generated every `step_size` packets when the window is full.
     ///
     /// # Panics
     ///
@@ -233,9 +278,20 @@ impl StreamingEncoder {
 
         // Add to buffer
         self.buffer.push_back(data.to_vec());
+        self.packets_since_parity += 1;
 
-        // Check if buffer is full
+        // Check if buffer is full and it's time to generate parities
         if self.buffer.len() < self.params.delay as usize {
+            return AddSourceResult {
+                source_seq: seq,
+                parities: vec![],
+            };
+        }
+
+        // Only generate parities every step_size packets
+        if self.packets_since_parity < self.params.step_size {
+            // Slide window but don't generate parities yet
+            self.buffer.pop_front();
             return AddSourceResult {
                 source_seq: seq,
                 parities: vec![],
@@ -245,8 +301,13 @@ impl StreamingEncoder {
         // Generate parities for the current window
         let parities = self.generate_parities(seq);
 
-        // Slide window: remove oldest
-        self.buffer.pop_front();
+        // Slide window by step_size
+        for _ in 0..self.params.step_size {
+            if !self.buffer.is_empty() {
+                self.buffer.pop_front();
+            }
+        }
+        self.packets_since_parity = 0;
 
         AddSourceResult {
             source_seq: seq,
@@ -277,6 +338,7 @@ impl StreamingEncoder {
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.next_seq = 0;
+        self.packets_since_parity = 0;
     }
 
     /// Generate parity symbols for the current full window.

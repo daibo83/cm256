@@ -51,6 +51,7 @@
 //! // result.parities contains generated parity symbols
 //! ```
 
+pub mod diagonal;
 pub mod streaming;
 
 // =============================================================================
