@@ -219,7 +219,7 @@ ffmpeg -re -i input.mp4 -c:v libx264 -tune zerolatency -f h264 - | \
 - `--delay <N>` - FEC window size in packets (default: 15)
 - `--parities <N>` - Parity packets per window (default: 1)
 - `--step-size <N>` - Generate parities every N packets (default: 5)
-- `--packet-size <N>` - Packet size in bytes (default: 1200)
+- `--packet-size <N>` - Packet size in bytes (default: 1200, sender only - receiver auto-detects)
 
 ### Benchmark Example
 

@@ -352,8 +352,8 @@ enum Command {
         #[arg(long, default_value = "5")]
         step_size: u8,
 
-        /// Packet size in bytes (must match sender)
-        #[arg(long, default_value = "1200")]
+        /// Packet size (ignored - auto-detected from sender)
+        #[arg(long, default_value = "1200", hide = true)]
         packet_size: usize,
     },
 }
@@ -535,14 +535,11 @@ async fn run_receiver(
     delay: u8,
     parities: u8,
     step_size: u8,
-    packet_size: usize,
+    _packet_size: usize, // Ignored - auto-detected from first packet
 ) -> Result<()> {
-    let params = StreamingParams::with_step_size(delay, parities, step_size, packet_size)
-        .context("Invalid streaming parameters")?;
-
     info!(
-        "Streaming Receiver on {}, transport={:?}, delay={}, parities={}, step_size={}, packet_size={}",
-        addr, transport_type, delay, parities, step_size, packet_size
+        "Streaming Receiver on {}, transport={:?}, delay={}, parities={}, step_size={} (packet_size auto-detected)",
+        addr, transport_type, delay, parities, step_size
     );
 
     let mut recv_buffer = vec![0u8; 65536];
@@ -576,10 +573,53 @@ async fn run_receiver(
                 "QUIC connection established from {}",
                 connection.remote_address()
             );
-            // Note: We'll send the ready signal after setup is complete
             (Transport::Quic(connection), None)
         }
     };
+
+    // For QUIC, send ready signal before receiving first packet
+    if matches!(transport_type, TransportType::Quic) {
+        info!("Sending ready signal to sender...");
+        transport
+            .send_datagram_async(b"READY")
+            .await
+            .context("Failed to send ready signal")?;
+    }
+
+    // Get first packet to determine packet size
+    let first_packet_len = match first_packet_len {
+        Some(n) => n, // UDP: already have first packet
+        None => {
+            // QUIC: need to receive first packet
+            transport
+                .recv_datagram_async(&mut recv_buffer)
+                .await
+                .context("Failed to receive first packet")?
+        }
+    };
+
+    // Auto-detect packet size from first datagram
+    if first_packet_len < PacketHeader::SIZE {
+        anyhow::bail!(
+            "First packet too small ({} bytes), expected at least {} bytes",
+            first_packet_len,
+            PacketHeader::SIZE
+        );
+    }
+    let packet_size = first_packet_len - PacketHeader::SIZE;
+    info!(
+        "Auto-detected packet_size={} from first datagram",
+        packet_size
+    );
+
+    // Now create params and decoder with correct packet size
+    let params = StreamingParams::with_step_size(delay, parities, step_size, packet_size)
+        .context("Invalid streaming parameters")?;
+    info!(
+        "  Max burst recovery: {} packets, overhead: {:.1}%",
+        params.max_burst(),
+        params.overhead() * 100.0
+    );
 
     let mut decoder = StreamingDecoder::new(params);
     decoder.set_history_windows(16);
@@ -615,15 +655,6 @@ async fn run_receiver(
             }
         }
     });
-
-    // For QUIC, send ready signal now that we're set up
-    if matches!(transport_type, TransportType::Quic) {
-        info!("Sending ready signal to sender...");
-        transport
-            .send_datagram_async(b"READY")
-            .await
-            .context("Failed to send ready signal")?;
-    }
 
     // Ordering task
     tokio::task::spawn(async move {
@@ -691,6 +722,12 @@ async fn run_receiver(
 
         let payload = &recv_buffer[PacketHeader::SIZE..n];
         if payload.len() < packet_size {
+            // Shouldn't happen since we auto-detected packet_size from first packet
+            warn!(
+                "Unexpected packet size: {} < {}, skipping",
+                payload.len(),
+                packet_size
+            );
             return;
         }
 
@@ -723,19 +760,17 @@ async fn run_receiver(
         }
     };
 
-    // Process the first packet that was received during UDP connection setup
-    if let Some(n) = first_packet_len {
-        process_packet(
-            n,
-            &recv_buffer,
-            &mut decoder,
-            &mut data_lengths,
-            &output_tx,
-            &mut source_count,
-            &mut parity_count,
-        );
-        packet_count += 1;
-    }
+    // Process the first packet (already in recv_buffer)
+    process_packet(
+        first_packet_len,
+        &recv_buffer,
+        &mut decoder,
+        &mut data_lengths,
+        &output_tx,
+        &mut source_count,
+        &mut parity_count,
+    );
+    packet_count += 1;
 
     loop {
         let n = match transport.recv_datagram_async(&mut recv_buffer).await {
