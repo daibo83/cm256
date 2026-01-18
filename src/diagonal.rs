@@ -5,41 +5,47 @@
 //!
 //! ## How It Works
 //!
-//! Each parity symbol is a simple XOR of source symbols at specific offsets:
+//! Each parity symbol is an XOR of source symbols at specific offsets:
 //!
 //! ```text
-//! P_t = S_t ⊕ S_{t-τ}
+//! P_t = S_t ⊕ S_{t-τ} ⊕ S_{t-2τ} ⊕ ... ⊕ S_{t-(span-1)τ}
 //! ```
 //!
-//! Where τ (tau) is the interleaving depth. This creates diagonal "stripes" of protection:
+//! Where:
+//! - τ (tau) is the interleaving depth (controls burst tolerance)
+//! - span is the number of sources XOR'd per parity (controls overhead)
 //!
-//! ```text
-//! Time:    0   1   2   3   4   5   6   7   8   ...
-//! Source:  S₀  S₁  S₂  S₃  S₄  S₅  S₆  S₇  S₈  ...
-//!          ╲   ╲   ╲   ╲   ╲   ╲   ╲   ╲   ╲
-//!           ╲   ╲   ╲   ╲   ╲   ╲   ╲   ╲   ╲
-//! Parity:      P₁  P₂  P₃  P₄  P₅  P₆  P₇  P₈  ...
-//!              ↓   ↓   ↓   ↓   ↓   ↓   ↓   ↓
-//!            S₁⊕S₀ S₂⊕S₁ ...
-//! ```
+//! ## Overhead Control
+//!
+//! The `span` parameter controls overhead:
+//! - span=2: 1 parity per 1 source = 100% overhead (default, original behavior)
+//! - span=3: 1 parity per 2 sources = 50% overhead
+//! - span=5: 1 parity per 4 sources = 25% overhead
+//! - span=6: 1 parity per 5 sources = 20% overhead
+//!
+//! Formula: overhead = 1/(span-1) or equivalently overhead = 1/data_sources_per_parity
 //!
 //! ## Burst Tolerance
 //!
-//! With interleaving depth τ:
+//! With interleaving depth τ and span s:
 //! - A burst of up to τ consecutive losses can be recovered
-//! - Each lost source S_i can be recovered from P_{i+τ} ⊕ S_{i+τ}
+//! - Recovery requires (span-1) of the span sources to be available
+//! - Each lost source S_i can be recovered from P_{i+(span-1)τ} ⊕ other sources
 //!
 //! ## Extended Diagonal (Multiple Parities)
 //!
 //! For higher burst tolerance, use multiple interleaving depths:
-//! - P_t,0 = S_t ⊕ S_{t-τ₀}
-//! - P_t,1 = S_t ⊕ S_{t-τ₁}
+//! - P_t,0 = S_t ⊕ S_{t-τ₀} ⊕ ...
+//! - P_t,1 = S_t ⊕ S_{t-τ₁} ⊕ ...
 //! - etc.
 //!
-//! ## Overhead
+//! ## Example Configurations
 //!
-//! - Simple diagonal: 1 parity per source = 100% overhead
-//! - Extended (n depths): n parities per source = n×100% overhead
+//! | Config | Overhead | Burst Tolerance | Use Case |
+//! |--------|----------|-----------------|----------|
+//! | span=2, τ=4 | 100% | 4 packets | Maximum burst protection |
+//! | span=5, τ=4 | 25% | 4 packets | Balanced |
+//! | span=6, τ=8 | 20% | 8 packets | Low overhead, good burst |
 
 use std::collections::{HashMap, VecDeque};
 
@@ -56,8 +62,11 @@ use crate::Error;
 /// ```rust
 /// use cm256::diagonal::DiagonalParams;
 ///
-/// // Simple diagonal with τ=8 (can recover burst of 8)
+/// // Simple diagonal with τ=8 (can recover burst of 8), 100% overhead
 /// let params = DiagonalParams::simple(8, 1200).unwrap();
+///
+/// // Low overhead: span=6 gives 20% overhead, τ=4 gives burst tolerance of 4
+/// let params = DiagonalParams::with_span(4, 6, 1200).unwrap();
 ///
 /// // Extended diagonal with τ=[4, 8, 12] (better random loss recovery)
 /// let params = DiagonalParams::extended(&[4, 8, 12], 1200).unwrap();
@@ -71,6 +80,10 @@ pub struct DiagonalParams {
     /// Maximum depth (for buffer sizing).
     max_depth: u16,
 
+    /// Number of sources XOR'd per parity (controls overhead).
+    /// span=2 → 100% overhead, span=5 → 25% overhead, span=6 → 20% overhead
+    span: u8,
+
     /// Size of each symbol in bytes.
     symbol_bytes: usize,
 }
@@ -81,7 +94,7 @@ impl DiagonalParams {
     /// - `depth`: Interleaving depth τ (burst tolerance)
     /// - `symbol_bytes`: Size of each symbol in bytes
     ///
-    /// Overhead: 100% (1 parity per source)
+    /// Overhead: 100% (1 parity per source, span=2)
     pub fn simple(depth: u16, symbol_bytes: usize) -> Result<Self, Error> {
         if depth == 0 || symbol_bytes == 0 {
             return Err(Error::InvalidParams);
@@ -89,6 +102,33 @@ impl DiagonalParams {
         Ok(Self {
             depths: vec![depth],
             max_depth: depth,
+            span: 2,
+            symbol_bytes,
+        })
+    }
+
+    /// Create diagonal interleaving with configurable span (overhead control).
+    ///
+    /// - `depth`: Interleaving depth τ (burst tolerance)
+    /// - `span`: Number of sources XOR'd per parity (2-255)
+    ///   - span=2: 100% overhead (1 parity per 1 source)
+    ///   - span=3: 50% overhead (1 parity per 2 sources)
+    ///   - span=5: 25% overhead (1 parity per 4 sources)
+    ///   - span=6: 20% overhead (1 parity per 5 sources)
+    /// - `symbol_bytes`: Size of each symbol in bytes
+    ///
+    /// # Recovery Requirements
+    ///
+    /// With span=s, recovery requires (s-1) of the s sources to be available.
+    /// Burst tolerance remains τ, but sources must be spaced by τ apart.
+    pub fn with_span(depth: u16, span: u8, symbol_bytes: usize) -> Result<Self, Error> {
+        if depth == 0 || symbol_bytes == 0 || span < 2 {
+            return Err(Error::InvalidParams);
+        }
+        Ok(Self {
+            depths: vec![depth],
+            max_depth: depth,
+            span,
             symbol_bytes,
         })
     }
@@ -116,6 +156,32 @@ impl DiagonalParams {
         Ok(Self {
             depths: depths.to_vec(),
             max_depth,
+            span: 2,
+            symbol_bytes,
+        })
+    }
+
+    /// Create extended diagonal with configurable span.
+    ///
+    /// - `depths`: Array of interleaving depths [τ₀, τ₁, ...]
+    /// - `span`: Number of sources XOR'd per parity (2-255)
+    /// - `symbol_bytes`: Size of each symbol in bytes
+    pub fn extended_with_span(
+        depths: &[u16],
+        span: u8,
+        symbol_bytes: usize,
+    ) -> Result<Self, Error> {
+        if depths.is_empty() || symbol_bytes == 0 || span < 2 {
+            return Err(Error::InvalidParams);
+        }
+        if depths.iter().any(|&d| d == 0) {
+            return Err(Error::InvalidParams);
+        }
+        let max_depth = *depths.iter().max().unwrap();
+        Ok(Self {
+            depths: depths.to_vec(),
+            max_depth,
+            span,
             symbol_bytes,
         })
     }
@@ -130,6 +196,11 @@ impl DiagonalParams {
         self.max_depth
     }
 
+    /// Get the span (number of sources per parity).
+    pub fn span(&self) -> u8 {
+        self.span
+    }
+
     /// Get the symbol size in bytes.
     pub fn symbol_bytes(&self) -> usize {
         self.symbol_bytes
@@ -141,8 +212,13 @@ impl DiagonalParams {
     }
 
     /// Overhead ratio (parity bytes / source bytes).
+    ///
+    /// With span=s: overhead = num_depths / (s - 1)
+    /// - span=2: 1.0 per depth (100%)
+    /// - span=5: 0.25 per depth (25%)
+    /// - span=6: 0.2 per depth (20%)
     pub fn overhead(&self) -> f32 {
-        self.depths.len() as f32
+        self.depths.len() as f32 / (self.span - 1) as f32
     }
 
     /// Maximum burst that can be recovered.
@@ -177,20 +253,23 @@ pub struct DiagonalParity {
     /// The interleaving depth τ for this parity.
     pub depth: u16,
 
-    /// The parity data: S_seq ⊕ S_{seq-depth}
+    /// Number of sources XOR'd in this parity.
+    pub span: u8,
+
+    /// The parity data: S_seq ⊕ S_{seq-depth} ⊕ S_{seq-2*depth} ⊕ ...
     pub data: Vec<u8>,
 }
 
 /// Diagonal interleaving encoder.
 ///
 /// Generates one parity per source per depth, where each parity is:
-/// P_t = S_t ⊕ S_{t-τ}
+/// P_t = S_t ⊕ S_{t-τ} ⊕ S_{t-2τ} ⊕ ... ⊕ S_{t-(span-1)τ}
 #[derive(Debug)]
 pub struct DiagonalEncoder {
     params: DiagonalParams,
 
     /// Ring buffer of recent source symbols.
-    /// Size = max_depth + 1
+    /// Size = (span-1) * max_depth + 1
     buffer: VecDeque<Vec<u8>>,
 
     /// Sequence number of the oldest symbol in buffer.
@@ -203,7 +282,8 @@ pub struct DiagonalEncoder {
 impl DiagonalEncoder {
     /// Create a new diagonal encoder.
     pub fn new(params: DiagonalParams) -> Self {
-        let buffer_size = params.max_depth as usize + 1;
+        // Need buffer for (span-1) * max_depth + 1 symbols
+        let buffer_size = (params.span as usize - 1) * params.max_depth as usize + 1;
         Self {
             params,
             buffer: VecDeque::with_capacity(buffer_size),
@@ -225,7 +305,7 @@ impl DiagonalEncoder {
     /// Add a source symbol and generate parities.
     ///
     /// Returns the assigned sequence number and parity symbols.
-    /// During warmup (first max_depth packets), fewer parities are generated.
+    /// During warmup (first (span-1)*max_depth packets), fewer parities are generated.
     pub fn add_source(&mut self, data: &[u8]) -> DiagonalEncodeResult {
         assert_eq!(
             data.len(),
@@ -242,34 +322,38 @@ impl DiagonalEncoder {
 
         // Generate parities for each depth
         let mut parities = Vec::with_capacity(self.params.depths.len());
+        let span = self.params.span as usize;
 
         for (depth_idx, &depth) in self.params.depths.iter().enumerate() {
-            // Check if we have enough history for this depth
-            if self.buffer.len() > depth as usize {
-                // P_t = S_t ⊕ S_{t-depth}
+            // Check if we have enough history for this depth and span
+            // Need (span-1) * depth symbols of history
+            let required_history = (span - 1) * depth as usize;
+            if self.buffer.len() > required_history {
+                // P_t = S_t ⊕ S_{t-depth} ⊕ S_{t-2*depth} ⊕ ... ⊕ S_{t-(span-1)*depth}
                 let current_idx = self.buffer.len() - 1;
-                let delayed_idx = current_idx - depth as usize;
 
-                let current = &self.buffer[current_idx];
-                let delayed = &self.buffer[delayed_idx];
-
-                // XOR the two sources
+                // XOR all span sources
                 let mut parity_data = vec![0u8; self.params.symbol_bytes];
-                for i in 0..self.params.symbol_bytes {
-                    parity_data[i] = current[i] ^ delayed[i];
+                for s in 0..span {
+                    let src_idx = current_idx - s * depth as usize;
+                    let src = &self.buffer[src_idx];
+                    for i in 0..self.params.symbol_bytes {
+                        parity_data[i] ^= src[i];
+                    }
                 }
 
                 parities.push(DiagonalParity {
                     seq,
                     depth_index: depth_idx as u8,
                     depth,
+                    span: self.params.span,
                     data: parity_data,
                 });
             }
         }
 
         // Trim buffer if it's too large
-        let max_buffer_size = self.params.max_depth as usize + 1;
+        let max_buffer_size = (span - 1) * self.params.max_depth as usize + 1;
         while self.buffer.len() > max_buffer_size {
             self.buffer.pop_front();
             self.buffer_start_seq = self.buffer_start_seq.wrapping_add(1);
@@ -305,17 +389,19 @@ pub struct ReceivedDiagonalParity {
     /// The interleaving depth τ.
     pub depth: u16,
 
+    /// Number of sources XOR'd in this parity.
+    pub span: u8,
+
     /// The parity data.
     pub data: Vec<u8>,
 }
 
 /// Diagonal interleaving decoder.
 ///
-/// Recovery is simple: if S_t is lost but we have P_t and S_{t-τ}:
-/// S_t = P_t ⊕ S_{t-τ}
+/// Recovery with span=s: if exactly 1 of the s sources is lost but we have P_t
+/// and the other (s-1) sources, we can recover the missing one:
 ///
-/// Or if S_{t-τ} is lost but we have P_t and S_t:
-/// S_{t-τ} = P_t ⊕ S_t
+/// S_missing = P_t ⊕ S_known1 ⊕ S_known2 ⊕ ... ⊕ S_known{s-1}
 #[derive(Debug)]
 pub struct DiagonalDecoder {
     params: DiagonalParams,
@@ -336,8 +422,9 @@ pub struct DiagonalDecoder {
 impl DiagonalDecoder {
     /// Create a new diagonal decoder.
     pub fn new(params: DiagonalParams) -> Self {
+        let span = params.span as u16;
         Self {
-            history_size: params.max_depth * 4,
+            history_size: params.max_depth * span * 2,
             params,
             sources: HashMap::new(),
             parities: HashMap::new(),
@@ -399,35 +486,42 @@ impl DiagonalDecoder {
                 };
 
                 let depth = parity.depth;
-                let delayed_seq = parity_seq.wrapping_sub(depth);
+                let span = parity.span as usize;
 
-                let have_current = self.sources.contains_key(&parity_seq);
-                let have_delayed = self.sources.contains_key(&delayed_seq);
+                // Collect source sequence numbers for this parity
+                // P_t = S_t ⊕ S_{t-depth} ⊕ S_{t-2*depth} ⊕ ... ⊕ S_{t-(span-1)*depth}
+                let mut source_seqs = Vec::with_capacity(span);
+                for s in 0..span {
+                    let src_seq = parity_seq.wrapping_sub((s as u16) * depth);
+                    source_seqs.push(src_seq);
+                }
 
-                if have_current && have_delayed {
-                    // Both sources present, parity not needed
+                // Count available and missing sources
+                let mut missing_seq = None;
+                let mut missing_count = 0;
+                for &src_seq in &source_seqs {
+                    if !self.sources.contains_key(&src_seq) {
+                        missing_count += 1;
+                        missing_seq = Some(src_seq);
+                    }
+                }
+
+                // Can only recover if exactly 1 source is missing
+                if missing_count != 1 {
                     continue;
                 }
 
-                if !have_current && !have_delayed {
-                    // Can't recover - need at least one source
-                    continue;
-                }
+                let missing_seq = missing_seq.unwrap();
 
-                // Can recover!
-                let (missing_seq, known_seq) = if have_current {
-                    (delayed_seq, parity_seq)
-                } else {
-                    (parity_seq, delayed_seq)
-                };
-
-                let known_data = self.sources.get(&known_seq).unwrap();
-                let parity_data = &parity.data;
-
-                // Recover: missing = parity ⊕ known
-                let mut recovered_data = vec![0u8; self.params.symbol_bytes];
-                for i in 0..self.params.symbol_bytes {
-                    recovered_data[i] = parity_data[i] ^ known_data[i];
+                // Recover: missing = parity ⊕ all_known_sources
+                let mut recovered_data = parity.data.clone();
+                for &src_seq in &source_seqs {
+                    if src_seq != missing_seq {
+                        let known_data = self.sources.get(&src_seq).unwrap();
+                        for i in 0..self.params.symbol_bytes {
+                            recovered_data[i] ^= known_data[i];
+                        }
+                    }
                 }
 
                 self.sources.insert(missing_seq, recovered_data.clone());
@@ -577,6 +671,7 @@ mod tests {
                     seq: parity.seq,
                     depth_index: parity.depth_index,
                     depth: parity.depth,
+                    span: parity.span,
                     data: parity.data,
                 });
             }
@@ -611,6 +706,7 @@ mod tests {
                     seq: parity.seq,
                     depth_index: parity.depth_index,
                     depth: parity.depth,
+                    span: parity.span,
                     data: parity.data,
                 });
             }
@@ -654,6 +750,7 @@ mod tests {
                     seq: parity.seq,
                     depth_index: parity.depth_index,
                     depth: parity.depth,
+                    span: parity.span,
                     data: parity.data,
                 });
             }
@@ -682,6 +779,7 @@ mod tests {
                     seq: parity.seq,
                     depth_index: parity.depth_index,
                     depth: parity.depth,
+                    span: parity.span,
                     data: parity.data,
                 });
             }
@@ -690,5 +788,93 @@ mod tests {
         // No recovery needed
         let recovered = decoder.try_recover();
         assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn test_span_overhead() {
+        // span=2 → 100% overhead
+        let p2 = DiagonalParams::simple(4, 16).unwrap();
+        assert!((p2.overhead() - 1.0).abs() < 0.001);
+        assert_eq!(p2.span(), 2);
+
+        // span=5 → 25% overhead (1 parity per 4 sources)
+        let p5 = DiagonalParams::with_span(4, 5, 16).unwrap();
+        assert!((p5.overhead() - 0.25).abs() < 0.001);
+        assert_eq!(p5.span(), 5);
+
+        // span=6 → 20% overhead (1 parity per 5 sources)
+        let p6 = DiagonalParams::with_span(4, 6, 16).unwrap();
+        assert!((p6.overhead() - 0.2).abs() < 0.001);
+        assert_eq!(p6.span(), 6);
+    }
+
+    #[test]
+    fn test_span5_parity_xor() {
+        // span=5: P_t = S_t ⊕ S_{t-τ} ⊕ S_{t-2τ} ⊕ S_{t-3τ} ⊕ S_{t-4τ}
+        let params = DiagonalParams::with_span(1, 5, 4).unwrap(); // depth=1 for easy testing
+        let mut encoder = DiagonalEncoder::new(params);
+
+        let sources: Vec<Vec<u8>> = (0..5).map(|i| vec![(i * 0x11) as u8; 4]).collect();
+
+        // Add 5 sources
+        for src in &sources {
+            encoder.add_source(src);
+        }
+
+        // After 5 sources, we should have a parity
+        let result = encoder.add_source(&vec![0x55; 4]);
+        assert_eq!(result.parities.len(), 1);
+
+        // P_5 = S_5 ⊕ S_4 ⊕ S_3 ⊕ S_2 ⊕ S_1
+        let mut expected = vec![0x55u8; 4]; // S_5
+        for i in 1..5 {
+            let src = &sources[i];
+            for j in 0..4 {
+                expected[j] ^= src[j];
+            }
+        }
+        assert_eq!(result.parities[0].data, expected);
+        assert_eq!(result.parities[0].span, 5);
+    }
+
+    #[test]
+    fn test_span5_recover_single() {
+        // With span=5, can recover if exactly 1 of 5 sources is lost
+        let params = DiagonalParams::with_span(2, 5, 16).unwrap();
+        let mut encoder = DiagonalEncoder::new(params.clone());
+        let mut decoder = DiagonalDecoder::new(params);
+
+        let originals: Vec<Vec<u8>> = (0..20).map(|i| vec![(i * 7) as u8; 16]).collect();
+
+        for (i, data) in originals.iter().enumerate() {
+            let result = encoder.add_source(data);
+
+            // "Lose" packet 10
+            if i != 10 {
+                decoder.add_source(result.source_seq, data);
+            }
+
+            for parity in result.parities {
+                decoder.add_parity(ReceivedDiagonalParity {
+                    seq: parity.seq,
+                    depth_index: parity.depth_index,
+                    depth: parity.depth,
+                    span: parity.span,
+                    data: parity.data,
+                });
+            }
+        }
+
+        // Recover
+        let recovered = decoder.try_recover();
+        let recovered_seqs: Vec<u16> = recovered.iter().map(|(seq, _)| *seq).collect();
+        assert!(recovered_seqs.contains(&10), "Should recover packet 10");
+
+        // Verify data
+        for (seq, data) in &recovered {
+            if *seq == 10 {
+                assert_eq!(data, &originals[10]);
+            }
+        }
     }
 }

@@ -19,10 +19,13 @@
 //! # How Diagonal Interleaving Works
 //!
 //! ```text
-//! P_t = S_t ⊕ S_{t-τ}
+//! P_t = S_t ⊕ S_{t-τ} ⊕ S_{t-2τ} ⊕ ... ⊕ S_{t-(span-1)τ}
 //! ```
 //!
-//! Each parity XORs the current source with one from τ packets ago.
+//! Each parity XORs `span` source packets separated by τ positions.
+//! - span=2: 100% overhead (original behavior, one parity per source)
+//! - span=6: ~20% overhead (one parity per 5 sources)
+//!
 //! This creates diagonal "stripes" of protection that can recover burst losses.
 
 use anyhow::{Context, Result};
@@ -45,13 +48,15 @@ use tracing::{debug, info, warn, Level};
 /// - byte 2: packet type (0 = source, 1 = parity)
 /// - byte 3: depth index (for parity) or reserved (for source)
 /// - bytes 4-5: depth τ (for parity) or data length (for source)
-/// - bytes 6-7: reserved
+/// - byte 6: span (for parity) or reserved (for source)
+/// - byte 7: reserved
 #[derive(Debug, Clone, Copy)]
 struct PacketHeader {
     seq: u16,
     is_parity: bool,
     depth_index: u8,
     depth: u16,
+    span: u8,
     data_len: u16,
 }
 
@@ -64,16 +69,18 @@ impl PacketHeader {
             is_parity: false,
             depth_index: 0,
             depth: 0,
+            span: 0,
             data_len,
         }
     }
 
-    fn parity(seq: u16, depth_index: u8, depth: u16) -> Self {
+    fn parity(seq: u16, depth_index: u8, depth: u16, span: u8) -> Self {
         Self {
             seq,
             is_parity: true,
             depth_index,
             depth,
+            span,
             data_len: 0,
         }
     }
@@ -85,6 +92,7 @@ impl PacketHeader {
         buf[3] = self.depth_index;
         if self.is_parity {
             buf[4..6].copy_from_slice(&self.depth.to_le_bytes());
+            buf[6] = self.span;
         } else {
             buf[4..6].copy_from_slice(&self.data_len.to_le_bytes());
         }
@@ -99,12 +107,14 @@ impl PacketHeader {
         let is_parity = buf[2] != 0;
         let depth_index = buf[3];
         let field = u16::from_le_bytes([buf[4], buf[5]]);
+        let span = buf[6];
 
         Some(Self {
             seq,
             is_parity,
             depth_index,
             depth: if is_parity { field } else { 0 },
+            span: if is_parity { span } else { 0 },
             data_len: if is_parity { 0 } else { field },
         })
     }
@@ -142,6 +152,11 @@ enum Command {
         #[arg(long, default_value = "8", value_delimiter = ',')]
         depths: Vec<u16>,
 
+        /// Span: number of sources XORed per parity. Controls overhead.
+        /// span=2: 100% overhead, span=6: 20% overhead
+        #[arg(long, default_value = "2")]
+        span: u8,
+
         /// Packet size in bytes
         #[arg(long, default_value = "1200")]
         packet_size: usize,
@@ -155,6 +170,10 @@ enum Command {
         /// Interleaving depths (must match sender)
         #[arg(long, default_value = "8", value_delimiter = ',')]
         depths: Vec<u16>,
+
+        /// Span (must match sender)
+        #[arg(long, default_value = "2")]
+        span: u8,
 
         /// Packet size in bytes (must match sender)
         #[arg(long, default_value = "1200")]
@@ -170,18 +189,19 @@ async fn run_sender(
     addr: SocketAddr,
     remote: SocketAddr,
     depths: Vec<u16>,
+    span: u8,
     packet_size: usize,
 ) -> Result<()> {
     let params = if depths.len() == 1 {
-        DiagonalParams::simple(depths[0], packet_size)
+        DiagonalParams::with_span(depths[0], span, packet_size)
     } else {
-        DiagonalParams::extended(&depths, packet_size)
+        DiagonalParams::extended_with_span(&depths, span, packet_size)
     }
     .context("Invalid diagonal parameters")?;
 
     info!(
-        "Diagonal Sender: {} -> {}, depths={:?}, packet_size={}",
-        addr, remote, depths, packet_size
+        "Diagonal Sender: {} -> {}, depths={:?}, span={}, packet_size={}",
+        addr, remote, depths, span, packet_size
     );
     info!(
         "  Max burst recovery: {} packets, overhead: {:.0}%",
@@ -252,7 +272,8 @@ async fn run_sender(
 
         // Send parity packets
         for parity in &result.parities {
-            let header = PacketHeader::parity(parity.seq, parity.depth_index, parity.depth);
+            let header =
+                PacketHeader::parity(parity.seq, parity.depth_index, parity.depth, parity.span);
             let mut packet = Vec::with_capacity(PacketHeader::SIZE + packet_size);
             packet.extend_from_slice(&header.to_bytes());
             packet.extend_from_slice(&parity.data);
@@ -286,17 +307,22 @@ async fn run_sender(
 // Receiver
 // ============================================================================
 
-async fn run_receiver(addr: SocketAddr, depths: Vec<u16>, packet_size: usize) -> Result<()> {
+async fn run_receiver(
+    addr: SocketAddr,
+    depths: Vec<u16>,
+    span: u8,
+    packet_size: usize,
+) -> Result<()> {
     let params = if depths.len() == 1 {
-        DiagonalParams::simple(depths[0], packet_size)
+        DiagonalParams::with_span(depths[0], span, packet_size)
     } else {
-        DiagonalParams::extended(&depths, packet_size)
+        DiagonalParams::extended_with_span(&depths, span, packet_size)
     }
     .context("Invalid diagonal parameters")?;
 
     info!(
-        "Diagonal Receiver on {}, depths={:?}, packet_size={}",
-        addr, depths, packet_size
+        "Diagonal Receiver on {}, depths={:?}, span={}, packet_size={}",
+        addr, depths, span, packet_size
     );
 
     let socket = UdpSocket::bind(addr)
@@ -411,6 +437,7 @@ async fn run_receiver(addr: SocketAddr, depths: Vec<u16>, packet_size: usize) ->
                 seq: header.seq,
                 depth_index: header.depth_index,
                 depth: header.depth,
+                span: header.span,
                 data: payload.to_vec(),
             });
             parity_count += 1;
@@ -479,13 +506,15 @@ async fn main() -> Result<()> {
             listen,
             remote,
             depths,
+            span,
             packet_size,
-        } => run_sender(listen, remote, depths, packet_size).await?,
+        } => run_sender(listen, remote, depths, span, packet_size).await?,
         Command::Recv {
             listen,
             depths,
+            span,
             packet_size,
-        } => run_receiver(listen, depths, packet_size).await?,
+        } => run_receiver(listen, depths, span, packet_size).await?,
     }
 
     Ok(())
