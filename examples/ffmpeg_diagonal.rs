@@ -154,7 +154,7 @@ enum Command {
 
         /// Span: number of sources XORed per parity. Controls overhead.
         /// span=2: 100% overhead, span=6: 20% overhead
-        #[arg(long, default_value = "2")]
+        #[arg(long, default_value = "6")]
         span: u8,
 
         /// Packet size in bytes
@@ -172,7 +172,7 @@ enum Command {
         depths: Vec<u16>,
 
         /// Span (must match sender)
-        #[arg(long, default_value = "2")]
+        #[arg(long, default_value = "6")]
         span: u8,
 
         /// Packet size in bytes (must match sender)
