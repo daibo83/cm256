@@ -329,9 +329,14 @@ impl DiagonalEncoder {
             // Need (span-1) * depth symbols of history
             let required_history = (span - 1) * depth as usize;
             if self.buffer.len() > required_history {
+                // Only emit parity every (span-1) sources
+                // This gives overhead = 1/(span-1) per depth
+                if seq as usize % (span - 1) != 0 {
+                    continue;
+                }
+
                 // P_t = S_t ⊕ S_{t-depth} ⊕ S_{t-2*depth} ⊕ ... ⊕ S_{t-(span-1)*depth}
                 let current_idx = self.buffer.len() - 1;
-
                 // XOR all span sources
                 let mut parity_data = vec![0u8; self.params.symbol_bytes];
                 for s in 0..span {
@@ -472,6 +477,7 @@ impl DiagonalDecoder {
     pub fn try_recover(&mut self) -> Vec<(u16, Vec<u8>)> {
         let mut recovered = Vec::new();
         let mut made_progress = true;
+        let mut used_parities = Vec::new();
 
         // Keep iterating until no more progress
         while made_progress {
@@ -481,6 +487,9 @@ impl DiagonalDecoder {
             let parity_keys: Vec<_> = self.parities.keys().cloned().collect();
 
             for (parity_seq, depth_idx) in parity_keys {
+                if used_parities.contains(&(parity_seq, depth_idx)) {
+                    continue;
+                }
                 let Some(parity) = self.parities.get(&(parity_seq, depth_idx)) else {
                     continue;
                 };
@@ -526,8 +535,14 @@ impl DiagonalDecoder {
 
                 self.sources.insert(missing_seq, recovered_data.clone());
                 recovered.push((missing_seq, recovered_data));
+                used_parities.push((parity_seq, depth_idx));
                 made_progress = true;
             }
+        }
+
+        // Remove used parities
+        for key in used_parities {
+            self.parities.remove(&key);
         }
 
         // Cleanup old data
@@ -811,24 +826,25 @@ mod tests {
     #[test]
     fn test_span5_parity_xor() {
         // span=5: P_t = S_t ⊕ S_{t-τ} ⊕ S_{t-2τ} ⊕ S_{t-3τ} ⊕ S_{t-4τ}
+        // With span=5, emit parity every 4 sources (after warmup)
         let params = DiagonalParams::with_span(1, 5, 4).unwrap(); // depth=1 for easy testing
         let mut encoder = DiagonalEncoder::new(params);
 
         let sources: Vec<Vec<u8>> = (0..5).map(|i| vec![(i * 0x11) as u8; 4]).collect();
 
-        // Add 5 sources
-        for src in &sources {
-            encoder.add_source(src);
+        // Add first 4 sources - no parity yet (warmup)
+        for src in &sources[..4] {
+            let result = encoder.add_source(src);
+            assert!(result.parities.is_empty());
         }
 
-        // After 5 sources, we should have a parity
-        let result = encoder.add_source(&vec![0x55; 4]);
+        // 5th source should trigger parity (index 4, source_count=4, 4%4=0)
+        let result = encoder.add_source(&sources[4]);
         assert_eq!(result.parities.len(), 1);
 
-        // P_5 = S_5 ⊕ S_4 ⊕ S_3 ⊕ S_2 ⊕ S_1
-        let mut expected = vec![0x55u8; 4]; // S_5
-        for i in 1..5 {
-            let src = &sources[i];
+        // P_4 = S_4 ⊕ S_3 ⊕ S_2 ⊕ S_1 ⊕ S_0
+        let mut expected = vec![0u8; 4];
+        for src in &sources {
             for j in 0..4 {
                 expected[j] ^= src[j];
             }
@@ -876,5 +892,31 @@ mod tests {
                 assert_eq!(data, &originals[10]);
             }
         }
+    }
+
+    #[test]
+    fn test_span6_actual_overhead() {
+        // Verify that span=6 actually produces ~20% overhead
+        let params = DiagonalParams::with_span(8, 6, 16).unwrap();
+        let mut encoder = DiagonalEncoder::new(params);
+
+        let mut source_count = 0u32;
+        let mut parity_count = 0u32;
+
+        // Send 1000 sources
+        for i in 0..1000u32 {
+            let data: Vec<u8> = (0..16).map(|j| ((i * 17 + j) & 0xFF) as u8).collect();
+            let result = encoder.add_source(&data);
+            source_count += 1;
+            parity_count += result.parities.len() as u32;
+        }
+
+        let actual_overhead = parity_count as f64 / source_count as f64;
+        // Should be close to 20% (0.2)
+        assert!(
+            (actual_overhead - 0.2).abs() < 0.05,
+            "Expected ~20% overhead, got {:.1}%",
+            actual_overhead * 100.0
+        );
     }
 }
