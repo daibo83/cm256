@@ -5,9 +5,11 @@ A pure Rust implementation of the CM256 Cauchy Reed-Solomon erasure coding libra
 ## Features
 
 - **Pure Rust** - No C/C++ dependencies, no FFI
-- **SIMD Optimized** - AVX2, SSE3/SSSE3, and NEON support with automatic detection
-- **Performance Parity** - Matches or exceeds C++ performance with AVX2
+- **SIMD Optimized** - AVX-512, AVX2, SSSE3, and NEON with **runtime detection** (no `-C target-cpu=native` required!)
+- **Performance Parity** - Matches or exceeds C++ performance
 - **Safe API** - Memory-safe Rust interface with minimal `unsafe` in SIMD hot paths
+- **Streaming FEC** - Low-latency diagonal interleaving for real-time applications
+- **Transport Abstraction** - Pluggable transport layer supporting UDP, QUIC, and custom transports
 
 ## Performance
 
@@ -17,10 +19,10 @@ Benchmarks on x86_64 with `k=100` original blocks, `m=30` recovery blocks, `1296
 
 | Implementation | Encode | Decode |
 |----------------|--------|--------|
-| **Rust + AVX-512** | **1642 MB/s** | **1652 MB/s** |
-| Rust + AVX2 | 1403 MB/s | 1415 MB/s |
+| **Rust + AVX-512 (auto-detected)** | **1742 MB/s** | **1619 MB/s** |
+| Rust + AVX2 (auto-detected) | 1380 MB/s | 1315 MB/s |
 | C++ + AVX2 (original) | 1283 MB/s | 1380 MB/s |
-| Rust + SSE3 | 745 MB/s | 755 MB/s |
+| Rust + SSSE3 (auto-detected) | 745 MB/s | 755 MB/s |
 | Rust + WASM SIMD | 487 MB/s | 584 MB/s |
 | Rust (scalar) | 71 MB/s | 76 MB/s |
 
@@ -33,7 +35,7 @@ Benchmarks on x86_64 with `k=100` original blocks, `m=30` recovery blocks, `1296
 | Rust + WASM SIMD | 1239 MB/s | 1234 MB/s |
 | Rust (scalar) | 131 MB/s | 142 MB/s |
 
-🏆 **Rust beats C++ on x86 (28% faster with AVX-512) and ARM!**
+🏆 **Rust beats C++ on x86 (36% faster with AVX-512) and ARM!**
 
 ### Run All Benchmarks
 
@@ -41,14 +43,25 @@ Benchmarks on x86_64 with `k=100` original blocks, `m=30` recovery blocks, `1296
 ./run_benchmarks.sh
 ```
 
-### Build for Maximum Performance
+### Runtime SIMD Detection
+
+SIMD instructions are automatically detected at runtime - no compiler flags needed!
+The library automatically selects the best available: AVX-512 → AVX2 → SSSE3 → scalar.
 
 ```bash
-# Enable native CPU features (AVX2 on most modern x86_64)
+# Just build normally - SIMD is auto-detected at runtime
+cargo build --release
+```
+
+For maximum performance with compile-time detection (slightly faster due to inlining):
+
+```bash
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 ## Usage
+
+### Block FEC (Traditional)
 
 ```rust
 use cm256::{Params, Block, encode_block, decode};
@@ -82,6 +95,136 @@ let mut recovery_blocks: Vec<Block> = recovery.iter()
 // Decode lost blocks
 let decoded = decode(&params, &blocks[30..], &recovery_blocks, &mut recovery).unwrap();
 assert_eq!(decoded[0], data[0]);
+```
+
+### Streaming FEC (Low-Latency)
+
+For real-time streaming applications where latency is critical:
+
+```rust
+use cm256::streaming::{StreamingEncoder, StreamingDecoder, StreamingParams};
+
+// delay=8 symbols, 2 parities per window, 1200 bytes per symbol
+let params = StreamingParams::new(8, 2, 1200).unwrap();
+
+let mut encoder = StreamingEncoder::new(params);
+let mut decoder = StreamingDecoder::new(params);
+
+// Encode source data - parities generated when window is full
+let data = vec![0x42u8; 1200];
+let result = encoder.add_source(&data);
+
+// Send source packet, then any parity packets
+// result.parities contains generated parity symbols
+for parity in &result.parities {
+    // Send parity.data with parity.end_seq and parity.parity_index
+}
+```
+
+## Streaming FEC Module
+
+The `streaming` module provides diagonal interleaving FEC for low-latency applications:
+
+```text
+Time:     0   1   2   3   4   5   6   7   8   ...
+Source:   S₀  S₁  S₂  S₃  S₄  S₅  S₆  S₇  S₈  ...
+          ╲   ╲   ╲   ╲   ╲
+Parity:       P₀  P₁  P₂  P₃  P₄  ...
+              │   │   │   │   │
+              └───┴───┴───┴───┴── Each Pᵢ covers [Sᵢ₋ₐ₊₁, Sᵢ]
+```
+
+### Key Features
+
+- **Lower latency** than block FEC - parities generated per-packet
+- **Burst recovery** - overlapping windows catch consecutive losses
+- **Continuous protection** - every packet covered by multiple parity windows
+
+### Transport Abstraction
+
+The `transport` module provides traits for abstracting over datagram transports:
+
+```rust
+use cm256::transport::{DatagramSend, DatagramRecv};
+use cm256::streaming::{TransportEncoder, TransportDecoder, StreamingParams};
+use std::net::UdpSocket;
+
+// Create connected UDP socket
+let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+socket.connect("127.0.0.1:9000").unwrap();
+
+// Wrap with FEC encoder
+let params = StreamingParams::new(8, 2, 1200).unwrap();
+let mut encoder = TransportEncoder::new(params, socket);
+
+// Send data - FEC encoding and transmission handled automatically
+encoder.send(&[0x42; 1200]).unwrap();
+```
+
+**Supported Transports:**
+- `std::net::UdpSocket` - Synchronous UDP
+- `tokio::net::UdpSocket` - Async UDP (requires `tokio` feature)
+- `quinn::Connection` - QUIC datagrams (requires `quinn` feature)
+- `UnixDatagram` - Unix datagram sockets
+- `MemoryChannel` - In-memory channels for testing
+- `LossyChannel<T>` - Wrapper for simulating packet loss
+
+### Async Transport Example
+
+```rust
+use cm256::streaming::{AsyncTransportEncoder, StreamingParams};
+use tokio::net::UdpSocket;
+
+async fn send_with_fec() -> std::io::Result<()> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.connect("127.0.0.1:9000").await?;
+
+    let params = StreamingParams::new(8, 2, 1200).unwrap();
+    let mut encoder = AsyncTransportEncoder::new(params, socket);
+
+    encoder.send(&[0x42; 1200]).await?;
+    Ok(())
+}
+```
+
+## Examples
+
+### FFmpeg Streaming Example
+
+Stream H.264 video with FEC protection over UDP or QUIC:
+
+```bash
+# Build with tokio support
+cargo build --release --example ffmpeg_streaming
+
+# UDP Transport (default)
+# Terminal 1 - Receiver (start first)
+cargo run --release --example ffmpeg_streaming -- recv | ffplay -f h264 -
+
+# Terminal 2 - Sender
+ffmpeg -re -i input.mp4 -c:v libx264 -tune zerolatency -f h264 - | \
+    cargo run --release --example ffmpeg_streaming -- send
+
+# QUIC Transport
+# Terminal 1 - Receiver (QUIC server)
+cargo run --release --example ffmpeg_streaming -- recv --transport quic | ffplay -f h264 -
+
+# Terminal 2 - Sender (QUIC client)
+ffmpeg -re -i input.mp4 -c:v libx264 -tune zerolatency -f h264 - | \
+    cargo run --release --example ffmpeg_streaming -- send --transport quic
+```
+
+**Options:**
+- `--transport <udp|quic>` - Transport type (default: udp)
+- `--delay <N>` - FEC window size in packets (default: 15)
+- `--parities <N>` - Parity packets per window (default: 1)
+- `--step-size <N>` - Generate parities every N packets (default: 5)
+- `--packet-size <N>` - Packet size in bytes (default: 1200)
+
+### Benchmark Example
+
+```bash
+cargo run --release --example benchmark
 ```
 
 ## Architecture Support
@@ -130,6 +273,25 @@ cargo test
 
 # Run benchmarks
 cargo run --release --example benchmark
+```
+
+### Optional Features
+
+| Feature | Description |
+|---------|-------------|
+| `simd` | SIMD acceleration (enabled by default) |
+| `tokio` | Async transport support for `tokio::net::UdpSocket` |
+| `quinn` | QUIC datagram transport via `quinn::Connection` |
+
+```bash
+# Build with async transport support
+cargo build --release --features tokio
+
+# Build with QUIC support
+cargo build --release --features quinn
+
+# Build examples with all features
+cargo build --release --examples --features "tokio quinn"
 ```
 
 ## WASM Support

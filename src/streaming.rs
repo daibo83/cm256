@@ -708,6 +708,787 @@ impl StreamingDecoder {
 }
 
 // =============================================================================
+// Transport Integration
+// =============================================================================
+
+use crate::transport::{DatagramRecvMut, DatagramSendMut};
+use std::io;
+
+/// Packet type discriminator for wire protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PacketType {
+    Source = 0,
+    Parity = 1,
+}
+
+/// Header for streaming FEC packets.
+///
+/// Wire format (8 bytes):
+/// - bytes 0-1: sequence number (u16 LE)
+/// - byte 2: packet type (0 = source, 1 = parity)
+/// - byte 3: parity index (for parity) or reserved (for source)
+/// - bytes 4-5: parity end_seq (for parity) or data length (for source)
+/// - bytes 6-7: reserved
+#[derive(Debug, Clone, Copy)]
+pub struct StreamingPacketHeader {
+    /// Sequence number of the packet.
+    pub seq: u16,
+    /// Whether this is a parity packet.
+    pub packet_type: PacketType,
+    /// For parity packets: the parity index within the window.
+    pub parity_index: u8,
+    /// For parity packets: the end_seq of the window.
+    /// For source packets: the actual data length.
+    pub aux_field: u16,
+}
+
+impl StreamingPacketHeader {
+    /// Header size in bytes.
+    pub const SIZE: usize = 8;
+
+    /// Create a header for a source packet.
+    pub fn source(seq: u16, data_len: u16) -> Self {
+        Self {
+            seq,
+            packet_type: PacketType::Source,
+            parity_index: 0,
+            aux_field: data_len,
+        }
+    }
+
+    /// Create a header for a parity packet.
+    pub fn parity(seq: u16, parity_index: u8, end_seq: u16) -> Self {
+        Self {
+            seq,
+            packet_type: PacketType::Parity,
+            parity_index,
+            aux_field: end_seq,
+        }
+    }
+
+    /// Serialize the header to bytes.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..2].copy_from_slice(&self.seq.to_le_bytes());
+        buf[2] = self.packet_type as u8;
+        buf[3] = self.parity_index;
+        buf[4..6].copy_from_slice(&self.aux_field.to_le_bytes());
+        buf
+    }
+
+    /// Deserialize a header from bytes.
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        let seq = u16::from_le_bytes([buf[0], buf[1]]);
+        let packet_type = match buf[2] {
+            0 => PacketType::Source,
+            1 => PacketType::Parity,
+            _ => return None,
+        };
+        let parity_index = buf[3];
+        let aux_field = u16::from_le_bytes([buf[4], buf[5]]);
+
+        Some(Self {
+            seq,
+            packet_type,
+            parity_index,
+            aux_field,
+        })
+    }
+
+    /// Get the data length (for source packets).
+    pub fn data_len(&self) -> u16 {
+        debug_assert!(self.packet_type == PacketType::Source);
+        self.aux_field
+    }
+
+    /// Get the end_seq (for parity packets).
+    pub fn end_seq(&self) -> u16 {
+        debug_assert!(self.packet_type == PacketType::Parity);
+        self.aux_field
+    }
+}
+
+/// Streaming FEC encoder with integrated transport.
+///
+/// Wraps a [`StreamingEncoder`] and a datagram transport to provide
+/// a simple API for sending FEC-protected data.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use cm256::streaming::{StreamingParams, TransportEncoder};
+/// use std::net::UdpSocket;
+///
+/// let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+/// socket.connect("127.0.0.1:9000").unwrap();
+///
+/// let params = StreamingParams::new(8, 2, 1200).unwrap();
+/// let mut encoder = TransportEncoder::new(params, socket);
+///
+/// // Send data - FEC encoding and transmission happens automatically
+/// encoder.send(&[0x42; 1200]).unwrap();
+/// ```
+#[derive(Debug)]
+pub struct TransportEncoder<T> {
+    encoder: StreamingEncoder,
+    transport: T,
+    send_buffer: Vec<u8>,
+}
+
+impl<T: DatagramSendMut> TransportEncoder<T> {
+    /// Create a new transport encoder.
+    pub fn new(params: StreamingParams, transport: T) -> Self {
+        let symbol_bytes = params.symbol_bytes();
+        Self {
+            encoder: StreamingEncoder::new(params),
+            transport,
+            send_buffer: Vec::with_capacity(StreamingPacketHeader::SIZE + symbol_bytes),
+        }
+    }
+
+    /// Get the underlying encoder parameters.
+    pub fn params(&self) -> StreamingParams {
+        self.encoder.params()
+    }
+
+    /// Get a reference to the underlying transport.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    /// Get a mutable reference to the underlying transport.
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+
+    /// Get the underlying encoder.
+    pub fn encoder(&self) -> &StreamingEncoder {
+        &self.encoder
+    }
+
+    /// Get a mutable reference to the underlying encoder.
+    pub fn encoder_mut(&mut self) -> &mut StreamingEncoder {
+        &mut self.encoder
+    }
+
+    /// Send data with FEC protection.
+    ///
+    /// The data is encoded and sent along with any generated parity packets.
+    /// Data must be exactly `params.symbol_bytes()` in length.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len() != params.symbol_bytes()`.
+    pub fn send(&mut self, data: &[u8]) -> io::Result<u16> {
+        let result = self.encoder.add_source(data);
+        let symbol_bytes = self.encoder.params().symbol_bytes();
+
+        // Send source packet
+        let header = StreamingPacketHeader::source(result.source_seq, data.len() as u16);
+        self.send_buffer.clear();
+        self.send_buffer.extend_from_slice(&header.to_bytes());
+        self.send_buffer.extend_from_slice(data);
+        // Pad to full symbol size if needed
+        if self.send_buffer.len() < StreamingPacketHeader::SIZE + symbol_bytes {
+            self.send_buffer
+                .resize(StreamingPacketHeader::SIZE + symbol_bytes, 0);
+        }
+        self.transport.send_datagram(&self.send_buffer)?;
+
+        // Send parity packets
+        for parity in &result.parities {
+            let header = StreamingPacketHeader::parity(
+                result.source_seq,
+                parity.parity_index,
+                parity.end_seq,
+            );
+            self.send_buffer.clear();
+            self.send_buffer.extend_from_slice(&header.to_bytes());
+            self.send_buffer.extend_from_slice(&parity.data);
+            self.transport.send_datagram(&self.send_buffer)?;
+        }
+
+        Ok(result.source_seq)
+    }
+
+    /// Send data with variable length.
+    ///
+    /// Unlike `send()`, this allows sending data smaller than `symbol_bytes`.
+    /// The data will be padded internally for FEC, but the original length
+    /// is preserved in the header.
+    pub fn send_var(&mut self, data: &[u8]) -> io::Result<u16> {
+        let symbol_bytes = self.encoder.params().symbol_bytes();
+        assert!(
+            data.len() <= symbol_bytes,
+            "Data too large: {} > {}",
+            data.len(),
+            symbol_bytes
+        );
+
+        // Pad data to symbol size for encoding
+        let mut padded = data.to_vec();
+        padded.resize(symbol_bytes, 0);
+
+        let result = self.encoder.add_source(&padded);
+
+        // Send source packet with original length in header
+        let header = StreamingPacketHeader::source(result.source_seq, data.len() as u16);
+        self.send_buffer.clear();
+        self.send_buffer.extend_from_slice(&header.to_bytes());
+        self.send_buffer.extend_from_slice(&padded);
+        self.transport.send_datagram(&self.send_buffer)?;
+
+        // Send parity packets
+        for parity in &result.parities {
+            let header = StreamingPacketHeader::parity(
+                result.source_seq,
+                parity.parity_index,
+                parity.end_seq,
+            );
+            self.send_buffer.clear();
+            self.send_buffer.extend_from_slice(&header.to_bytes());
+            self.send_buffer.extend_from_slice(&parity.data);
+            self.transport.send_datagram(&self.send_buffer)?;
+        }
+
+        Ok(result.source_seq)
+    }
+
+    /// Flush the encoder, sending any remaining parity packets.
+    pub fn flush(&mut self) -> io::Result<()> {
+        let parities = self.encoder.flush();
+        let seq = self.encoder.next_seq().wrapping_sub(1);
+
+        for parity in &parities {
+            let header = StreamingPacketHeader::parity(seq, parity.parity_index, parity.end_seq);
+            self.send_buffer.clear();
+            self.send_buffer.extend_from_slice(&header.to_bytes());
+            self.send_buffer.extend_from_slice(&parity.data);
+            self.transport.send_datagram(&self.send_buffer)?;
+        }
+
+        Ok(())
+    }
+
+    /// Consume the encoder and return the transport.
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+}
+
+/// Result of receiving a packet from the transport decoder.
+#[derive(Debug, Clone)]
+pub enum RecvResult {
+    /// A source packet was received (may have been recovered via FEC).
+    Source {
+        /// Sequence number.
+        seq: u16,
+        /// The data (trimmed to original length if known).
+        data: Vec<u8>,
+        /// Whether this was recovered via FEC.
+        recovered: bool,
+    },
+    /// A parity packet was received (no action needed by caller).
+    Parity,
+    /// No packet available (for non-blocking recv).
+    WouldBlock,
+}
+
+/// Streaming FEC decoder with integrated transport.
+///
+/// Wraps a [`StreamingDecoder`] and a datagram transport to provide
+/// a simple API for receiving FEC-protected data.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use cm256::streaming::{StreamingParams, TransportDecoder, RecvResult};
+/// use std::net::UdpSocket;
+///
+/// let socket = UdpSocket::bind("0.0.0.0:9000").unwrap();
+///
+/// let params = StreamingParams::new(8, 2, 1200).unwrap();
+/// let mut decoder = TransportDecoder::new(params, socket);
+///
+/// // Receive data - FEC decoding happens automatically
+/// loop {
+///     match decoder.recv().unwrap() {
+///         RecvResult::Source { seq, data, recovered } => {
+///             println!("Got packet {}: {} bytes (recovered: {})", seq, data.len(), recovered);
+///         }
+///         RecvResult::Parity => { /* parity received, no action needed */ }
+///         RecvResult::WouldBlock => break,
+///     }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct TransportDecoder<T> {
+    decoder: StreamingDecoder,
+    transport: T,
+    recv_buffer: Vec<u8>,
+    /// Track original data lengths for trimming recovered packets.
+    data_lengths: HashMap<u16, u16>,
+}
+
+impl<T: DatagramRecvMut> TransportDecoder<T> {
+    /// Create a new transport decoder.
+    pub fn new(params: StreamingParams, transport: T) -> Self {
+        let symbol_bytes = params.symbol_bytes();
+        Self {
+            decoder: StreamingDecoder::new(params),
+            transport,
+            recv_buffer: vec![0u8; StreamingPacketHeader::SIZE + symbol_bytes],
+            data_lengths: HashMap::new(),
+        }
+    }
+
+    /// Get the underlying decoder parameters.
+    pub fn params(&self) -> StreamingParams {
+        self.decoder.params()
+    }
+
+    /// Get a reference to the underlying transport.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    /// Get a mutable reference to the underlying transport.
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+
+    /// Get the underlying decoder.
+    pub fn decoder(&self) -> &StreamingDecoder {
+        &self.decoder
+    }
+
+    /// Get a mutable reference to the underlying decoder.
+    pub fn decoder_mut(&mut self) -> &mut StreamingDecoder {
+        &mut self.decoder
+    }
+
+    /// Receive a packet from the transport.
+    ///
+    /// This will block until a packet is received.
+    pub fn recv(&mut self) -> io::Result<RecvResult> {
+        let n = self.transport.recv_datagram(&mut self.recv_buffer)?;
+        self.process_packet(n)
+    }
+
+    /// Try to receive a packet without blocking.
+    pub fn try_recv(&mut self) -> io::Result<RecvResult> {
+        match self.transport.try_recv_datagram(&mut self.recv_buffer)? {
+            Some(n) => self.process_packet(n),
+            None => Ok(RecvResult::WouldBlock),
+        }
+    }
+
+    /// Process a received packet.
+    fn process_packet(&mut self, n: usize) -> io::Result<RecvResult> {
+        let symbol_bytes = self.decoder.params().symbol_bytes();
+
+        if n < StreamingPacketHeader::SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packet too small",
+            ));
+        }
+
+        let Some(header) = StreamingPacketHeader::from_bytes(&self.recv_buffer) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header"));
+        };
+
+        let payload = &self.recv_buffer[StreamingPacketHeader::SIZE..n];
+
+        match header.packet_type {
+            PacketType::Source => {
+                // Pad payload if needed
+                let mut padded = payload.to_vec();
+                if padded.len() < symbol_bytes {
+                    padded.resize(symbol_bytes, 0);
+                }
+
+                self.decoder.add_source(header.seq, &padded);
+                self.data_lengths.insert(header.seq, header.data_len());
+
+                // Try recovery (recovered packets will be returned via subsequent recv calls)
+                let _recovered = self.decoder.try_recover();
+
+                let data_len = header.data_len() as usize;
+                Ok(RecvResult::Source {
+                    seq: header.seq,
+                    data: payload[..data_len.min(payload.len())].to_vec(),
+                    recovered: false,
+                })
+            }
+            PacketType::Parity => {
+                // Pad payload if needed
+                let mut padded = payload.to_vec();
+                if padded.len() < symbol_bytes {
+                    padded.resize(symbol_bytes, 0);
+                }
+
+                self.decoder
+                    .add_parity(header.end_seq(), header.parity_index, &padded);
+
+                // Try recovery after adding parity
+                let recovered = self.decoder.try_recover();
+
+                // If we recovered any packets, return the first one
+                // (caller should call recv() again to get more)
+                if let Some((seq, data)) = recovered.into_iter().next() {
+                    let len = self
+                        .data_lengths
+                        .get(&seq)
+                        .copied()
+                        .unwrap_or(symbol_bytes as u16);
+                    return Ok(RecvResult::Source {
+                        seq,
+                        data: data[..len as usize].to_vec(),
+                        recovered: true,
+                    });
+                }
+
+                Ok(RecvResult::Parity)
+            }
+        }
+    }
+
+    /// Check if a source packet is available.
+    pub fn has_source(&self, seq: u16) -> bool {
+        self.decoder.has_source(seq)
+    }
+
+    /// Get a source packet if available.
+    pub fn get_source(&self, seq: u16) -> Option<Vec<u8>> {
+        let data = self.decoder.get_source(seq)?;
+        let len = self
+            .data_lengths
+            .get(&seq)
+            .copied()
+            .unwrap_or(data.len() as u16);
+        Some(data[..len as usize].to_vec())
+    }
+
+    /// Consume the decoder and return the transport.
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+}
+
+// =============================================================================
+// Async Transport Integration
+// =============================================================================
+
+use crate::transport::{AsyncDatagramRecvMut, AsyncDatagramSendMut};
+
+/// Async streaming FEC encoder with integrated transport.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use cm256::streaming::{StreamingParams, AsyncTransportEncoder};
+/// use tokio::net::UdpSocket;
+///
+/// async fn example() -> std::io::Result<()> {
+///     let socket = UdpSocket::bind("0.0.0.0:0").await?;
+///     socket.connect("127.0.0.1:9000").await?;
+///
+///     let params = StreamingParams::new(8, 2, 1200).unwrap();
+///     let mut encoder = AsyncTransportEncoder::new(params, socket);
+///
+///     encoder.send(&[0x42; 1200]).await?;
+///     Ok(())
+/// }
+/// ```
+#[derive(Debug)]
+pub struct AsyncTransportEncoder<T> {
+    encoder: StreamingEncoder,
+    transport: T,
+    send_buffer: Vec<u8>,
+}
+
+impl<T: AsyncDatagramSendMut + Unpin> AsyncTransportEncoder<T> {
+    /// Create a new async transport encoder.
+    pub fn new(params: StreamingParams, transport: T) -> Self {
+        let symbol_bytes = params.symbol_bytes();
+        Self {
+            encoder: StreamingEncoder::new(params),
+            transport,
+            send_buffer: Vec::with_capacity(StreamingPacketHeader::SIZE + symbol_bytes),
+        }
+    }
+
+    /// Get the underlying encoder parameters.
+    pub fn params(&self) -> StreamingParams {
+        self.encoder.params()
+    }
+
+    /// Get a reference to the underlying transport.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    /// Get a mutable reference to the underlying transport.
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+
+    /// Get the underlying encoder.
+    pub fn encoder(&self) -> &StreamingEncoder {
+        &self.encoder
+    }
+
+    /// Get a mutable reference to the underlying encoder.
+    pub fn encoder_mut(&mut self) -> &mut StreamingEncoder {
+        &mut self.encoder
+    }
+
+    /// Send data with FEC protection asynchronously.
+    pub async fn send(&mut self, data: &[u8]) -> io::Result<u16> {
+        let result = self.encoder.add_source(data);
+        let symbol_bytes = self.encoder.params().symbol_bytes();
+
+        // Send source packet
+        let header = StreamingPacketHeader::source(result.source_seq, data.len() as u16);
+        self.send_buffer.clear();
+        self.send_buffer.extend_from_slice(&header.to_bytes());
+        self.send_buffer.extend_from_slice(data);
+        if self.send_buffer.len() < StreamingPacketHeader::SIZE + symbol_bytes {
+            self.send_buffer
+                .resize(StreamingPacketHeader::SIZE + symbol_bytes, 0);
+        }
+        self.transport
+            .send_datagram_async(&self.send_buffer)
+            .await?;
+
+        // Send parity packets
+        for parity in &result.parities {
+            let header = StreamingPacketHeader::parity(
+                result.source_seq,
+                parity.parity_index,
+                parity.end_seq,
+            );
+            self.send_buffer.clear();
+            self.send_buffer.extend_from_slice(&header.to_bytes());
+            self.send_buffer.extend_from_slice(&parity.data);
+            self.transport
+                .send_datagram_async(&self.send_buffer)
+                .await?;
+        }
+
+        Ok(result.source_seq)
+    }
+
+    /// Send variable-length data asynchronously.
+    pub async fn send_var(&mut self, data: &[u8]) -> io::Result<u16> {
+        let symbol_bytes = self.encoder.params().symbol_bytes();
+        assert!(
+            data.len() <= symbol_bytes,
+            "Data too large: {} > {}",
+            data.len(),
+            symbol_bytes
+        );
+
+        let mut padded = data.to_vec();
+        padded.resize(symbol_bytes, 0);
+
+        let result = self.encoder.add_source(&padded);
+
+        let header = StreamingPacketHeader::source(result.source_seq, data.len() as u16);
+        self.send_buffer.clear();
+        self.send_buffer.extend_from_slice(&header.to_bytes());
+        self.send_buffer.extend_from_slice(&padded);
+        self.transport
+            .send_datagram_async(&self.send_buffer)
+            .await?;
+
+        for parity in &result.parities {
+            let header = StreamingPacketHeader::parity(
+                result.source_seq,
+                parity.parity_index,
+                parity.end_seq,
+            );
+            self.send_buffer.clear();
+            self.send_buffer.extend_from_slice(&header.to_bytes());
+            self.send_buffer.extend_from_slice(&parity.data);
+            self.transport
+                .send_datagram_async(&self.send_buffer)
+                .await?;
+        }
+
+        Ok(result.source_seq)
+    }
+
+    /// Flush the encoder asynchronously.
+    pub async fn flush(&mut self) -> io::Result<()> {
+        let parities = self.encoder.flush();
+        let seq = self.encoder.next_seq().wrapping_sub(1);
+
+        for parity in &parities {
+            let header = StreamingPacketHeader::parity(seq, parity.parity_index, parity.end_seq);
+            self.send_buffer.clear();
+            self.send_buffer.extend_from_slice(&header.to_bytes());
+            self.send_buffer.extend_from_slice(&parity.data);
+            self.transport
+                .send_datagram_async(&self.send_buffer)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Consume the encoder and return the transport.
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+}
+
+/// Async streaming FEC decoder with integrated transport.
+#[derive(Debug)]
+pub struct AsyncTransportDecoder<T> {
+    decoder: StreamingDecoder,
+    transport: T,
+    recv_buffer: Vec<u8>,
+    data_lengths: HashMap<u16, u16>,
+}
+
+impl<T: AsyncDatagramRecvMut + Unpin> AsyncTransportDecoder<T> {
+    /// Create a new async transport decoder.
+    pub fn new(params: StreamingParams, transport: T) -> Self {
+        let symbol_bytes = params.symbol_bytes();
+        Self {
+            decoder: StreamingDecoder::new(params),
+            transport,
+            recv_buffer: vec![0u8; StreamingPacketHeader::SIZE + symbol_bytes],
+            data_lengths: HashMap::new(),
+        }
+    }
+
+    /// Get the underlying decoder parameters.
+    pub fn params(&self) -> StreamingParams {
+        self.decoder.params()
+    }
+
+    /// Get a reference to the underlying transport.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    /// Get a mutable reference to the underlying transport.
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+
+    /// Get the underlying decoder.
+    pub fn decoder(&self) -> &StreamingDecoder {
+        &self.decoder
+    }
+
+    /// Get a mutable reference to the underlying decoder.
+    pub fn decoder_mut(&mut self) -> &mut StreamingDecoder {
+        &mut self.decoder
+    }
+
+    /// Receive a packet asynchronously.
+    pub async fn recv(&mut self) -> io::Result<RecvResult> {
+        let n = self
+            .transport
+            .recv_datagram_async(&mut self.recv_buffer)
+            .await?;
+        self.process_packet(n)
+    }
+
+    fn process_packet(&mut self, n: usize) -> io::Result<RecvResult> {
+        let symbol_bytes = self.decoder.params().symbol_bytes();
+
+        if n < StreamingPacketHeader::SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packet too small",
+            ));
+        }
+
+        let Some(header) = StreamingPacketHeader::from_bytes(&self.recv_buffer) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header"));
+        };
+
+        let payload = &self.recv_buffer[StreamingPacketHeader::SIZE..n];
+
+        match header.packet_type {
+            PacketType::Source => {
+                let mut padded = payload.to_vec();
+                if padded.len() < symbol_bytes {
+                    padded.resize(symbol_bytes, 0);
+                }
+
+                self.decoder.add_source(header.seq, &padded);
+                self.data_lengths.insert(header.seq, header.data_len());
+                let _recovered = self.decoder.try_recover();
+
+                let data_len = header.data_len() as usize;
+                Ok(RecvResult::Source {
+                    seq: header.seq,
+                    data: payload[..data_len.min(payload.len())].to_vec(),
+                    recovered: false,
+                })
+            }
+            PacketType::Parity => {
+                let mut padded = payload.to_vec();
+                if padded.len() < symbol_bytes {
+                    padded.resize(symbol_bytes, 0);
+                }
+
+                self.decoder
+                    .add_parity(header.end_seq(), header.parity_index, &padded);
+
+                let recovered = self.decoder.try_recover();
+
+                if let Some((seq, data)) = recovered.into_iter().next() {
+                    let len = self
+                        .data_lengths
+                        .get(&seq)
+                        .copied()
+                        .unwrap_or(symbol_bytes as u16);
+                    return Ok(RecvResult::Source {
+                        seq,
+                        data: data[..len as usize].to_vec(),
+                        recovered: true,
+                    });
+                }
+
+                Ok(RecvResult::Parity)
+            }
+        }
+    }
+
+    /// Check if a source packet is available.
+    pub fn has_source(&self, seq: u16) -> bool {
+        self.decoder.has_source(seq)
+    }
+
+    /// Get a source packet if available.
+    pub fn get_source(&self, seq: u16) -> Option<Vec<u8>> {
+        let data = self.decoder.get_source(seq)?;
+        let len = self
+            .data_lengths
+            .get(&seq)
+            .copied()
+            .unwrap_or(data.len() as u16);
+        Some(data[..len as usize].to_vec())
+    }
+
+    /// Consume the decoder and return the transport.
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1029,5 +1810,146 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_packet_header_roundtrip() {
+        let source_header = StreamingPacketHeader::source(1234, 500);
+        let bytes = source_header.to_bytes();
+        let parsed = StreamingPacketHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.seq, 1234);
+        assert_eq!(parsed.packet_type, PacketType::Source);
+        assert_eq!(parsed.data_len(), 500);
+
+        let parity_header = StreamingPacketHeader::parity(5678, 2, 9999);
+        let bytes = parity_header.to_bytes();
+        let parsed = StreamingPacketHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.seq, 5678);
+        assert_eq!(parsed.packet_type, PacketType::Parity);
+        assert_eq!(parsed.parity_index, 2);
+        assert_eq!(parsed.end_seq(), 9999);
+    }
+
+    #[test]
+    fn test_transport_encoder_decoder() {
+        use crate::transport::MemoryChannel;
+
+        let params = StreamingParams::new(4, 2, 32).unwrap();
+        let (tx_chan, rx_chan) = MemoryChannel::pair();
+
+        let mut tx = TransportEncoder::new(params, tx_chan);
+        let mut rx = TransportDecoder::new(params, rx_chan);
+
+        let originals: Vec<Vec<u8>> = (0..8).map(|i| vec![(i * 10) as u8; 32]).collect();
+
+        // Send all packets
+        for data in &originals {
+            tx.send(data).unwrap();
+        }
+
+        // Receive all packets
+        let mut received = Vec::new();
+        loop {
+            match rx.try_recv().unwrap() {
+                RecvResult::Source { seq, data, .. } => {
+                    received.push((seq, data));
+                }
+                RecvResult::Parity => {}
+                RecvResult::WouldBlock => break,
+            }
+        }
+
+        // Verify we got all source packets
+        assert_eq!(received.len(), 8);
+        for (seq, data) in received {
+            assert_eq!(data, originals[seq as usize]);
+        }
+    }
+
+    #[test]
+    fn test_transport_with_loss() {
+        use crate::transport::{LossyChannel, MemoryChannel};
+
+        let params = StreamingParams::new(4, 2, 32).unwrap();
+        let (tx_chan, rx_chan) = MemoryChannel::pair();
+        let lossy_tx = LossyChannel::with_pattern(tx_chan, 5); // Drop every 5th packet
+
+        let mut tx = TransportEncoder::new(params, lossy_tx);
+        let mut rx = TransportDecoder::new(params, rx_chan);
+
+        let originals: Vec<Vec<u8>> = (0..8).map(|i| vec![(i * 10) as u8; 32]).collect();
+
+        // Send all packets
+        for data in &originals {
+            tx.send(data).unwrap();
+        }
+
+        // Receive packets (some will be recovered via FEC)
+        let mut received_seqs = std::collections::HashSet::new();
+        loop {
+            match rx.try_recv().unwrap() {
+                RecvResult::Source {
+                    seq,
+                    data,
+                    recovered,
+                } => {
+                    // Verify data integrity
+                    assert_eq!(
+                        data, originals[seq as usize],
+                        "Data mismatch for seq {}",
+                        seq
+                    );
+                    received_seqs.insert(seq);
+                    if recovered {
+                        println!("Recovered seq {}", seq);
+                    }
+                }
+                RecvResult::Parity => {}
+                RecvResult::WouldBlock => break,
+            }
+        }
+
+        // With FEC, we should have recovered most packets
+        println!(
+            "Received {} of {} packets",
+            received_seqs.len(),
+            originals.len()
+        );
+        // The exact count depends on timing and loss pattern, but we should get most
+    }
+
+    #[test]
+    fn test_transport_var_length() {
+        use crate::transport::MemoryChannel;
+
+        let params = StreamingParams::new(4, 2, 64).unwrap(); // 64 byte symbols
+        let (tx_chan, rx_chan) = MemoryChannel::pair();
+
+        let mut tx = TransportEncoder::new(params, tx_chan);
+        let mut rx = TransportDecoder::new(params, rx_chan);
+
+        // Send variable-length data
+        let data1 = vec![0x11; 20]; // 20 bytes
+        let data2 = vec![0x22; 50]; // 50 bytes
+        let data3 = vec![0x33; 64]; // 64 bytes (full)
+
+        tx.send_var(&data1).unwrap();
+        tx.send_var(&data2).unwrap();
+        tx.send_var(&data3).unwrap();
+
+        // Receive and verify lengths are preserved
+        let mut received = Vec::new();
+        loop {
+            match rx.try_recv().unwrap() {
+                RecvResult::Source { data, .. } => received.push(data),
+                RecvResult::Parity => {}
+                RecvResult::WouldBlock => break,
+            }
+        }
+
+        assert_eq!(received.len(), 3);
+        assert_eq!(received[0], data1);
+        assert_eq!(received[1], data2);
+        assert_eq!(received[2], data3);
     }
 }

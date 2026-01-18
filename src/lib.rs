@@ -51,8 +51,8 @@
 //! // result.parities contains generated parity symbols
 //! ```
 
-pub mod diagonal;
 pub mod streaming;
+pub mod transport;
 
 // =============================================================================
 // GF(256) Arithmetic - Polynomial 0x14d (x^8 + x^6 + x^3 + x^2 + 1)
@@ -130,12 +130,6 @@ static INV_TABLE: InvTable = InvTable::new();
 pub struct Gf256(pub u8);
 
 impl Gf256 {
-    /// Const-compatible GF(256) multiplication
-    /// Polynomial: 0x14d = x^8 + x^6 + x^3 + x^2 + 1
-    const fn gf_mul_const(a: u8, b: u8) -> u8 {
-        InvTable::gf_mul(a, b)
-    }
-
     /// GF(256) multiplicative inverse using precomputed table
     /// Returns 0 for input 0 (mathematically undefined but convenient)
     #[inline]
@@ -330,7 +324,7 @@ impl<'a> BlockMut<'a> {
 ///
 /// Where:
 /// - x_i is the recovery block index
-/// - x_0 = original_count (first recovery block index)  
+/// - x_0 = original_count (first recovery block index)
 /// - y_j is the original block index (column)
 #[inline]
 fn get_matrix_element(x_i: u8, x_0: u8, y_j: u8) -> Gf256 {
@@ -465,15 +459,18 @@ impl NibbleTables {
 #[allow(dead_code)]
 static NIBBLE_TABLES: NibbleTables = NibbleTables::new();
 
-// SIMD implementation using target_feature
-#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
-mod simd {
+// =============================================================================
+// x86_64 SIMD with Runtime Detection
+// =============================================================================
+
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+mod simd_x86 {
     use super::*;
     use std::arch::x86_64::*;
 
     /// Multiply 16 bytes by a coefficient using SSSE3 pshufb
     #[inline(always)]
-    pub unsafe fn mul_16(
+    unsafe fn mul_16(
         src: *const u8,
         table_lo: __m128i,
         table_hi: __m128i,
@@ -488,9 +485,8 @@ mod simd {
     }
 
     /// Multiply 32 bytes by a coefficient using AVX2 vpshufb
-    #[cfg(target_feature = "avx2")]
     #[inline(always)]
-    pub unsafe fn mul_32(
+    unsafe fn mul_32(
         src: *const u8,
         table_lo: __m256i,
         table_hi: __m256i,
@@ -505,9 +501,8 @@ mod simd {
     }
 
     /// Multiply 64 bytes by a coefficient using AVX-512 vpshufb
-    #[cfg(target_feature = "avx512bw")]
-    #[inline(always)]
-    pub unsafe fn mul_64(
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn mul_64(
         src: *const u8,
         table_lo: __m512i,
         table_hi: __m512i,
@@ -521,15 +516,16 @@ mod simd {
         _mm512_xor_si512(lo_result, hi_result)
     }
 
-    /// dst[i] = src[i] * coeff using SIMD (AVX-512 > AVX2 > SSE3)
-    #[cfg(target_feature = "avx512bw")]
-    #[target_feature(enable = "avx512bw")]
-    pub unsafe fn gf256_mul_mem_simd(dst: &mut [u8], src: &[u8], coeff: u8) {
+    // =========================================================================
+    // AVX-512 implementations
+    // =========================================================================
+
+    #[target_feature(enable = "avx512f", enable = "avx512bw")]
+    pub unsafe fn gf256_mul_mem_avx512(dst: &mut [u8], src: &[u8], coeff: u8) {
         let len = dst.len();
         let lo_table = NIBBLE_TABLES.get_lo(coeff);
         let hi_table = NIBBLE_TABLES.get_hi(coeff);
 
-        // Create 512-bit tables by broadcasting the 128-bit tables 4x
         let table_lo_128 = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
         let table_hi_128 = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
         let table_lo = _mm512_broadcast_i32x4(table_lo_128);
@@ -559,7 +555,7 @@ mod simd {
             _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, result);
         }
 
-        // Handle remaining bytes with AVX2
+        // Handle remaining with AVX2
         let remainder_64 = remainder_256 + chunks_64 * 64;
         let table_lo_256 = _mm256_broadcastsi128_si256(table_lo_128);
         let table_hi_256 = _mm256_broadcastsi128_si256(table_hi_128);
@@ -574,7 +570,7 @@ mod simd {
             _mm256_storeu_si256(dst.as_mut_ptr().add(remainder_64) as *mut __m256i, result);
         }
 
-        // Handle 16-byte remainder with SSE3
+        // Handle 16-byte remainder
         let remainder_32 = (len / 32) * 32;
         let mask_0f_128 = _mm_set1_epi8(0x0f);
         if len >= remainder_32 + 16 {
@@ -587,7 +583,7 @@ mod simd {
             _mm_storeu_si128(dst.as_mut_ptr().add(remainder_32) as *mut __m128i, result);
         }
 
-        // Handle final remainder with scalar
+        // Scalar remainder
         let remainder_start = (len / 16) * 16;
         let table = MUL_TABLES.get(coeff);
         for i in remainder_start..len {
@@ -595,109 +591,8 @@ mod simd {
         }
     }
 
-    /// dst[i] = src[i] * coeff using SIMD (AVX2)
-    #[cfg(all(target_feature = "avx2", not(target_feature = "avx512bw")))]
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn gf256_mul_mem_simd(dst: &mut [u8], src: &[u8], coeff: u8) {
-        let len = dst.len();
-        let lo_table = NIBBLE_TABLES.get_lo(coeff);
-        let hi_table = NIBBLE_TABLES.get_hi(coeff);
-
-        // Create 256-bit tables by duplicating the 128-bit tables
-        let table_lo_128 = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
-        let table_hi_128 = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
-        let table_lo = _mm256_broadcastsi128_si256(table_lo_128);
-        let table_hi = _mm256_broadcastsi128_si256(table_hi_128);
-        let mask_0f = _mm256_set1_epi8(0x0f);
-
-        // Process 128 bytes at a time (4x unrolled)
-        let chunks_128 = len / 128;
-        for i in 0..chunks_128 {
-            let offset = i * 128;
-            let r0 = mul_32(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
-            let r1 = mul_32(src.as_ptr().add(offset + 32), table_lo, table_hi, mask_0f);
-            let r2 = mul_32(src.as_ptr().add(offset + 64), table_lo, table_hi, mask_0f);
-            let r3 = mul_32(src.as_ptr().add(offset + 96), table_lo, table_hi, mask_0f);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, r0);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 32) as *mut __m256i, r1);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 64) as *mut __m256i, r2);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 96) as *mut __m256i, r3);
-        }
-
-        // Handle remaining 32-byte chunks
-        let remainder_128 = chunks_128 * 128;
-        let chunks_32 = (len - remainder_128) / 32;
-        for i in 0..chunks_32 {
-            let offset = remainder_128 + i * 32;
-            let result = mul_32(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, result);
-        }
-
-        // Handle 16-byte remainder with SSE3
-        let remainder_32 = remainder_128 + chunks_32 * 32;
-        let mask_0f_128 = _mm_set1_epi8(0x0f);
-        if len >= remainder_32 + 16 {
-            let result = mul_16(
-                src.as_ptr().add(remainder_32),
-                table_lo_128,
-                table_hi_128,
-                mask_0f_128,
-            );
-            _mm_storeu_si128(dst.as_mut_ptr().add(remainder_32) as *mut __m128i, result);
-        }
-
-        // Handle final remainder with scalar
-        let remainder_start = (len / 16) * 16;
-        let table = MUL_TABLES.get(coeff);
-        for i in remainder_start..len {
-            dst[i] = table[src[i] as usize];
-        }
-    }
-
-    #[cfg(not(target_feature = "avx2"))]
-    #[target_feature(enable = "ssse3")]
-    pub unsafe fn gf256_mul_mem_simd(dst: &mut [u8], src: &[u8], coeff: u8) {
-        let len = dst.len();
-        let lo_table = NIBBLE_TABLES.get_lo(coeff);
-        let hi_table = NIBBLE_TABLES.get_hi(coeff);
-        let table_lo = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
-        let table_hi = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
-        let mask_0f = _mm_set1_epi8(0x0f);
-
-        // Process 64 bytes at a time (4x unrolled)
-        let chunks_64 = len / 64;
-        for i in 0..chunks_64 {
-            let offset = i * 64;
-            let r0 = mul_16(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
-            let r1 = mul_16(src.as_ptr().add(offset + 16), table_lo, table_hi, mask_0f);
-            let r2 = mul_16(src.as_ptr().add(offset + 32), table_lo, table_hi, mask_0f);
-            let r3 = mul_16(src.as_ptr().add(offset + 48), table_lo, table_hi, mask_0f);
-            _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, r0);
-            _mm_storeu_si128(dst.as_mut_ptr().add(offset + 16) as *mut __m128i, r1);
-            _mm_storeu_si128(dst.as_mut_ptr().add(offset + 32) as *mut __m128i, r2);
-            _mm_storeu_si128(dst.as_mut_ptr().add(offset + 48) as *mut __m128i, r3);
-        }
-
-        // Handle remaining 16-byte chunks
-        let remainder_64 = chunks_64 * 64;
-        let chunks_16 = (len - remainder_64) / 16;
-        for i in 0..chunks_16 {
-            let offset = remainder_64 + i * 16;
-            let result = mul_16(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
-            _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, result);
-        }
-
-        let remainder_start = (len / 16) * 16;
-        let table = MUL_TABLES.get(coeff);
-        for i in remainder_start..len {
-            dst[i] = table[src[i] as usize];
-        }
-    }
-
-    /// dst[i] ^= src[i] * coeff using SIMD (AVX-512)
-    #[cfg(target_feature = "avx512bw")]
-    #[target_feature(enable = "avx512bw")]
-    pub unsafe fn gf256_muladd_mem_simd(dst: &mut [u8], src: &[u8], coeff: u8) {
+    #[target_feature(enable = "avx512f", enable = "avx512bw")]
+    pub unsafe fn gf256_muladd_mem_avx512(dst: &mut [u8], src: &[u8], coeff: u8) {
         let len = dst.len();
         let lo_table = NIBBLE_TABLES.get_lo(coeff);
         let hi_table = NIBBLE_TABLES.get_hi(coeff);
@@ -751,7 +646,7 @@ mod simd {
             );
         }
 
-        // Handle remaining with smaller SIMD
+        // Handle remaining with AVX2
         let remainder_64 = remainder_256 + chunks_64 * 64;
         let table_lo_256 = _mm256_broadcastsi128_si256(table_lo_128);
         let table_hi_256 = _mm256_broadcastsi128_si256(table_hi_128);
@@ -770,6 +665,7 @@ mod simd {
             );
         }
 
+        // Handle 16-byte remainder
         let remainder_32 = (len / 32) * 32;
         let mask_0f_128 = _mm_set1_epi8(0x0f);
         if len >= remainder_32 + 16 {
@@ -786,6 +682,7 @@ mod simd {
             );
         }
 
+        // Scalar remainder
         let remainder_start = (len / 16) * 16;
         let table = MUL_TABLES.get(coeff);
         for i in remainder_start..len {
@@ -793,144 +690,8 @@ mod simd {
         }
     }
 
-    /// dst[i] ^= src[i] * coeff using SIMD (AVX2)
-    #[cfg(all(target_feature = "avx2", not(target_feature = "avx512bw")))]
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn gf256_muladd_mem_simd(dst: &mut [u8], src: &[u8], coeff: u8) {
-        let len = dst.len();
-        let lo_table = NIBBLE_TABLES.get_lo(coeff);
-        let hi_table = NIBBLE_TABLES.get_hi(coeff);
-
-        let table_lo_128 = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
-        let table_hi_128 = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
-        let table_lo = _mm256_broadcastsi128_si256(table_lo_128);
-        let table_hi = _mm256_broadcastsi128_si256(table_hi_128);
-        let mask_0f = _mm256_set1_epi8(0x0f);
-
-        // Process 128 bytes at a time (4x unrolled)
-        let chunks_128 = len / 128;
-        for i in 0..chunks_128 {
-            let offset = i * 128;
-            let p0 = mul_32(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
-            let p1 = mul_32(src.as_ptr().add(offset + 32), table_lo, table_hi, mask_0f);
-            let p2 = mul_32(src.as_ptr().add(offset + 64), table_lo, table_hi, mask_0f);
-            let p3 = mul_32(src.as_ptr().add(offset + 96), table_lo, table_hi, mask_0f);
-            let c0 = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
-            let c1 = _mm256_loadu_si256(dst.as_ptr().add(offset + 32) as *const __m256i);
-            let c2 = _mm256_loadu_si256(dst.as_ptr().add(offset + 64) as *const __m256i);
-            let c3 = _mm256_loadu_si256(dst.as_ptr().add(offset + 96) as *const __m256i);
-            _mm256_storeu_si256(
-                dst.as_mut_ptr().add(offset) as *mut __m256i,
-                _mm256_xor_si256(c0, p0),
-            );
-            _mm256_storeu_si256(
-                dst.as_mut_ptr().add(offset + 32) as *mut __m256i,
-                _mm256_xor_si256(c1, p1),
-            );
-            _mm256_storeu_si256(
-                dst.as_mut_ptr().add(offset + 64) as *mut __m256i,
-                _mm256_xor_si256(c2, p2),
-            );
-            _mm256_storeu_si256(
-                dst.as_mut_ptr().add(offset + 96) as *mut __m256i,
-                _mm256_xor_si256(c3, p3),
-            );
-        }
-
-        // Handle remaining 32-byte chunks
-        let remainder_128 = chunks_128 * 128;
-        let chunks_32 = (len - remainder_128) / 32;
-        for i in 0..chunks_32 {
-            let offset = remainder_128 + i * 32;
-            let product = mul_32(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
-            let current = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
-            let result = _mm256_xor_si256(current, product);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, result);
-        }
-
-        let remainder_32 = remainder_128 + chunks_32 * 32;
-        let mask_0f_128 = _mm_set1_epi8(0x0f);
-        if len >= remainder_32 + 16 {
-            let product = mul_16(
-                src.as_ptr().add(remainder_32),
-                table_lo_128,
-                table_hi_128,
-                mask_0f_128,
-            );
-            let current = _mm_loadu_si128(dst.as_ptr().add(remainder_32) as *const __m128i);
-            let result = _mm_xor_si128(current, product);
-            _mm_storeu_si128(dst.as_mut_ptr().add(remainder_32) as *mut __m128i, result);
-        }
-
-        let remainder_start = (len / 16) * 16;
-        let table = MUL_TABLES.get(coeff);
-        for i in remainder_start..len {
-            dst[i] ^= table[src[i] as usize];
-        }
-    }
-
-    #[cfg(not(target_feature = "avx2"))]
-    #[target_feature(enable = "ssse3")]
-    pub unsafe fn gf256_muladd_mem_simd(dst: &mut [u8], src: &[u8], coeff: u8) {
-        let len = dst.len();
-        let lo_table = NIBBLE_TABLES.get_lo(coeff);
-        let hi_table = NIBBLE_TABLES.get_hi(coeff);
-        let table_lo = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
-        let table_hi = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
-        let mask_0f = _mm_set1_epi8(0x0f);
-
-        // Process 64 bytes at a time (4x unrolled)
-        let chunks_64 = len / 64;
-        for i in 0..chunks_64 {
-            let offset = i * 64;
-            let p0 = mul_16(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
-            let p1 = mul_16(src.as_ptr().add(offset + 16), table_lo, table_hi, mask_0f);
-            let p2 = mul_16(src.as_ptr().add(offset + 32), table_lo, table_hi, mask_0f);
-            let p3 = mul_16(src.as_ptr().add(offset + 48), table_lo, table_hi, mask_0f);
-            let c0 = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
-            let c1 = _mm_loadu_si128(dst.as_ptr().add(offset + 16) as *const __m128i);
-            let c2 = _mm_loadu_si128(dst.as_ptr().add(offset + 32) as *const __m128i);
-            let c3 = _mm_loadu_si128(dst.as_ptr().add(offset + 48) as *const __m128i);
-            _mm_storeu_si128(
-                dst.as_mut_ptr().add(offset) as *mut __m128i,
-                _mm_xor_si128(c0, p0),
-            );
-            _mm_storeu_si128(
-                dst.as_mut_ptr().add(offset + 16) as *mut __m128i,
-                _mm_xor_si128(c1, p1),
-            );
-            _mm_storeu_si128(
-                dst.as_mut_ptr().add(offset + 32) as *mut __m128i,
-                _mm_xor_si128(c2, p2),
-            );
-            _mm_storeu_si128(
-                dst.as_mut_ptr().add(offset + 48) as *mut __m128i,
-                _mm_xor_si128(c3, p3),
-            );
-        }
-
-        // Handle remaining 16-byte chunks
-        let remainder_64 = chunks_64 * 64;
-        let chunks_16 = (len - remainder_64) / 16;
-        for i in 0..chunks_16 {
-            let offset = remainder_64 + i * 16;
-            let product = mul_16(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
-            let current = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
-            let result = _mm_xor_si128(current, product);
-            _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, result);
-        }
-
-        let remainder_start = (len / 16) * 16;
-        let table = MUL_TABLES.get(coeff);
-        for i in remainder_start..len {
-            dst[i] ^= table[src[i] as usize];
-        }
-    }
-
-    /// dst[i] = dst[i] * coeff in-place using SIMD (AVX-512)
-    #[cfg(target_feature = "avx512bw")]
-    #[target_feature(enable = "avx512bw")]
-    pub unsafe fn gf256_mul_mem_inplace_simd(dst: &mut [u8], coeff: u8) {
+    #[target_feature(enable = "avx512f", enable = "avx512bw")]
+    pub unsafe fn gf256_mul_mem_inplace_avx512(dst: &mut [u8], coeff: u8) {
         let len = dst.len();
         let lo_table = NIBBLE_TABLES.get_lo(coeff);
         let hi_table = NIBBLE_TABLES.get_hi(coeff);
@@ -982,6 +743,7 @@ mod simd {
             _mm_storeu_si128(dst.as_mut_ptr().add(remainder_32) as *mut __m128i, result);
         }
 
+        // Scalar remainder
         let remainder_start = (len / 16) * 16;
         let table = MUL_TABLES.get(coeff);
         for i in remainder_start..len {
@@ -989,10 +751,267 @@ mod simd {
         }
     }
 
-    /// dst[i] = dst[i] * coeff in-place using SIMD (AVX2)
-    #[cfg(all(target_feature = "avx2", not(target_feature = "avx512bw")))]
+    // =========================================================================
+    // SSSE3 implementations
+    // =========================================================================
+
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn gf256_mul_mem_ssse3(dst: &mut [u8], src: &[u8], coeff: u8) {
+        let len = dst.len();
+        let lo_table = NIBBLE_TABLES.get_lo(coeff);
+        let hi_table = NIBBLE_TABLES.get_hi(coeff);
+        let table_lo = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
+        let table_hi = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
+        let mask_0f = _mm_set1_epi8(0x0f);
+
+        let chunks_64 = len / 64;
+        for i in 0..chunks_64 {
+            let offset = i * 64;
+            let r0 = mul_16(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
+            let r1 = mul_16(src.as_ptr().add(offset + 16), table_lo, table_hi, mask_0f);
+            let r2 = mul_16(src.as_ptr().add(offset + 32), table_lo, table_hi, mask_0f);
+            let r3 = mul_16(src.as_ptr().add(offset + 48), table_lo, table_hi, mask_0f);
+            _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, r0);
+            _mm_storeu_si128(dst.as_mut_ptr().add(offset + 16) as *mut __m128i, r1);
+            _mm_storeu_si128(dst.as_mut_ptr().add(offset + 32) as *mut __m128i, r2);
+            _mm_storeu_si128(dst.as_mut_ptr().add(offset + 48) as *mut __m128i, r3);
+        }
+
+        let remainder_64 = chunks_64 * 64;
+        let chunks_16 = (len - remainder_64) / 16;
+        for i in 0..chunks_16 {
+            let offset = remainder_64 + i * 16;
+            let result = mul_16(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
+            _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, result);
+        }
+
+        let remainder_start = (len / 16) * 16;
+        let table = MUL_TABLES.get(coeff);
+        for i in remainder_start..len {
+            dst[i] = table[src[i] as usize];
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn gf256_muladd_mem_ssse3(dst: &mut [u8], src: &[u8], coeff: u8) {
+        let len = dst.len();
+        let lo_table = NIBBLE_TABLES.get_lo(coeff);
+        let hi_table = NIBBLE_TABLES.get_hi(coeff);
+        let table_lo = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
+        let table_hi = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
+        let mask_0f = _mm_set1_epi8(0x0f);
+
+        let chunks_64 = len / 64;
+        for i in 0..chunks_64 {
+            let offset = i * 64;
+            let p0 = mul_16(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
+            let p1 = mul_16(src.as_ptr().add(offset + 16), table_lo, table_hi, mask_0f);
+            let p2 = mul_16(src.as_ptr().add(offset + 32), table_lo, table_hi, mask_0f);
+            let p3 = mul_16(src.as_ptr().add(offset + 48), table_lo, table_hi, mask_0f);
+            let c0 = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
+            let c1 = _mm_loadu_si128(dst.as_ptr().add(offset + 16) as *const __m128i);
+            let c2 = _mm_loadu_si128(dst.as_ptr().add(offset + 32) as *const __m128i);
+            let c3 = _mm_loadu_si128(dst.as_ptr().add(offset + 48) as *const __m128i);
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(offset) as *mut __m128i,
+                _mm_xor_si128(c0, p0),
+            );
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(offset + 16) as *mut __m128i,
+                _mm_xor_si128(c1, p1),
+            );
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(offset + 32) as *mut __m128i,
+                _mm_xor_si128(c2, p2),
+            );
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(offset + 48) as *mut __m128i,
+                _mm_xor_si128(c3, p3),
+            );
+        }
+
+        let remainder_64 = chunks_64 * 64;
+        let chunks_16 = (len - remainder_64) / 16;
+        for i in 0..chunks_16 {
+            let offset = remainder_64 + i * 16;
+            let product = mul_16(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
+            let current = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(offset) as *mut __m128i,
+                _mm_xor_si128(current, product),
+            );
+        }
+
+        let remainder_start = (len / 16) * 16;
+        let table = MUL_TABLES.get(coeff);
+        for i in remainder_start..len {
+            dst[i] ^= table[src[i] as usize];
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn gf256_mul_mem_inplace_ssse3(dst: &mut [u8], coeff: u8) {
+        let len = dst.len();
+        let lo_table = NIBBLE_TABLES.get_lo(coeff);
+        let hi_table = NIBBLE_TABLES.get_hi(coeff);
+        let table_lo = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
+        let table_hi = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
+        let mask_0f = _mm_set1_epi8(0x0f);
+
+        let chunks = len / 16;
+        for i in 0..chunks {
+            let offset = i * 16;
+            let data = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
+            let lo_nibbles = _mm_and_si128(data, mask_0f);
+            let lo_result = _mm_shuffle_epi8(table_lo, lo_nibbles);
+            let hi_nibbles = _mm_and_si128(_mm_srli_epi64(data, 4), mask_0f);
+            let hi_result = _mm_shuffle_epi8(table_hi, hi_nibbles);
+            let result = _mm_xor_si128(lo_result, hi_result);
+            _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, result);
+        }
+
+        let remainder_start = chunks * 16;
+        let table = MUL_TABLES.get(coeff);
+        for i in remainder_start..len {
+            dst[i] = table[dst[i] as usize];
+        }
+    }
+
+    // =========================================================================
+    // AVX2 implementations
+    // =========================================================================
+
     #[target_feature(enable = "avx2")]
-    pub unsafe fn gf256_mul_mem_inplace_simd(dst: &mut [u8], coeff: u8) {
+    pub unsafe fn gf256_mul_mem_avx2(dst: &mut [u8], src: &[u8], coeff: u8) {
+        let len = dst.len();
+        let lo_table = NIBBLE_TABLES.get_lo(coeff);
+        let hi_table = NIBBLE_TABLES.get_hi(coeff);
+
+        let table_lo_128 = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
+        let table_hi_128 = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
+        let table_lo = _mm256_broadcastsi128_si256(table_lo_128);
+        let table_hi = _mm256_broadcastsi128_si256(table_hi_128);
+        let mask_0f = _mm256_set1_epi8(0x0f);
+
+        let chunks_128 = len / 128;
+        for i in 0..chunks_128 {
+            let offset = i * 128;
+            let r0 = mul_32(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
+            let r1 = mul_32(src.as_ptr().add(offset + 32), table_lo, table_hi, mask_0f);
+            let r2 = mul_32(src.as_ptr().add(offset + 64), table_lo, table_hi, mask_0f);
+            let r3 = mul_32(src.as_ptr().add(offset + 96), table_lo, table_hi, mask_0f);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, r0);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 32) as *mut __m256i, r1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 64) as *mut __m256i, r2);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 96) as *mut __m256i, r3);
+        }
+
+        let remainder_128 = chunks_128 * 128;
+        let chunks_32 = (len - remainder_128) / 32;
+        for i in 0..chunks_32 {
+            let offset = remainder_128 + i * 32;
+            let result = mul_32(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, result);
+        }
+
+        // Handle remainder with SSSE3
+        let remainder_32 = remainder_128 + chunks_32 * 32;
+        let mask_0f_128 = _mm_set1_epi8(0x0f);
+        if len >= remainder_32 + 16 {
+            let result = mul_16(
+                src.as_ptr().add(remainder_32),
+                table_lo_128,
+                table_hi_128,
+                mask_0f_128,
+            );
+            _mm_storeu_si128(dst.as_mut_ptr().add(remainder_32) as *mut __m128i, result);
+        }
+
+        let remainder_start = (len / 16) * 16;
+        let table = MUL_TABLES.get(coeff);
+        for i in remainder_start..len {
+            dst[i] = table[src[i] as usize];
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn gf256_muladd_mem_avx2(dst: &mut [u8], src: &[u8], coeff: u8) {
+        let len = dst.len();
+        let lo_table = NIBBLE_TABLES.get_lo(coeff);
+        let hi_table = NIBBLE_TABLES.get_hi(coeff);
+
+        let table_lo_128 = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
+        let table_hi_128 = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
+        let table_lo = _mm256_broadcastsi128_si256(table_lo_128);
+        let table_hi = _mm256_broadcastsi128_si256(table_hi_128);
+        let mask_0f = _mm256_set1_epi8(0x0f);
+
+        let chunks_128 = len / 128;
+        for i in 0..chunks_128 {
+            let offset = i * 128;
+            let p0 = mul_32(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
+            let p1 = mul_32(src.as_ptr().add(offset + 32), table_lo, table_hi, mask_0f);
+            let p2 = mul_32(src.as_ptr().add(offset + 64), table_lo, table_hi, mask_0f);
+            let p3 = mul_32(src.as_ptr().add(offset + 96), table_lo, table_hi, mask_0f);
+            let c0 = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+            let c1 = _mm256_loadu_si256(dst.as_ptr().add(offset + 32) as *const __m256i);
+            let c2 = _mm256_loadu_si256(dst.as_ptr().add(offset + 64) as *const __m256i);
+            let c3 = _mm256_loadu_si256(dst.as_ptr().add(offset + 96) as *const __m256i);
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(offset) as *mut __m256i,
+                _mm256_xor_si256(c0, p0),
+            );
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(offset + 32) as *mut __m256i,
+                _mm256_xor_si256(c1, p1),
+            );
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(offset + 64) as *mut __m256i,
+                _mm256_xor_si256(c2, p2),
+            );
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(offset + 96) as *mut __m256i,
+                _mm256_xor_si256(c3, p3),
+            );
+        }
+
+        let remainder_128 = chunks_128 * 128;
+        let chunks_32 = (len - remainder_128) / 32;
+        for i in 0..chunks_32 {
+            let offset = remainder_128 + i * 32;
+            let product = mul_32(src.as_ptr().add(offset), table_lo, table_hi, mask_0f);
+            let current = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(offset) as *mut __m256i,
+                _mm256_xor_si256(current, product),
+            );
+        }
+
+        let remainder_32 = remainder_128 + chunks_32 * 32;
+        let mask_0f_128 = _mm_set1_epi8(0x0f);
+        if len >= remainder_32 + 16 {
+            let product = mul_16(
+                src.as_ptr().add(remainder_32),
+                table_lo_128,
+                table_hi_128,
+                mask_0f_128,
+            );
+            let current = _mm_loadu_si128(dst.as_ptr().add(remainder_32) as *const __m128i);
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(remainder_32) as *mut __m128i,
+                _mm_xor_si128(current, product),
+            );
+        }
+
+        let remainder_start = (len / 16) * 16;
+        let table = MUL_TABLES.get(coeff);
+        for i in remainder_start..len {
+            dst[i] ^= table[src[i] as usize];
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn gf256_mul_mem_inplace_avx2(dst: &mut [u8], coeff: u8) {
         let len = dst.len();
         let lo_table = NIBBLE_TABLES.get_lo(coeff);
         let hi_table = NIBBLE_TABLES.get_hi(coeff);
@@ -1034,33 +1053,108 @@ mod simd {
         }
     }
 
-    #[cfg(not(target_feature = "avx2"))]
-    #[target_feature(enable = "ssse3")]
-    pub unsafe fn gf256_mul_mem_inplace_simd(dst: &mut [u8], coeff: u8) {
-        let len = dst.len();
-        let lo_table = NIBBLE_TABLES.get_lo(coeff);
-        let hi_table = NIBBLE_TABLES.get_hi(coeff);
-        let table_lo = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
-        let table_hi = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
-        let mask_0f = _mm_set1_epi8(0x0f);
+    // =========================================================================
+    // Runtime dispatch - optimized for minimal overhead
+    // =========================================================================
 
-        let chunks = len / 16;
-        for i in 0..chunks {
-            let offset = i * 16;
-            let data = _mm_loadu_si128(dst.as_ptr().add(offset) as *const __m128i);
-            let lo_nibbles = _mm_and_si128(data, mask_0f);
-            let lo_result = _mm_shuffle_epi8(table_lo, lo_nibbles);
-            let hi_nibbles = _mm_and_si128(_mm_srli_epi64(data, 4), mask_0f);
-            let hi_result = _mm_shuffle_epi8(table_hi, hi_nibbles);
-            let result = _mm_xor_si128(lo_result, hi_result);
-            _mm_storeu_si128(dst.as_mut_ptr().add(offset) as *mut __m128i, result);
-        }
+    use std::ptr;
+    use std::sync::atomic::{AtomicPtr, Ordering};
 
-        let remainder_start = chunks * 16;
+    type MulMemFn = unsafe fn(&mut [u8], &[u8], u8);
+    type MulAddMemFn = unsafe fn(&mut [u8], &[u8], u8);
+    type MulMemInplaceFn = unsafe fn(&mut [u8], u8);
+
+    static MUL_MEM_FN: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+    static MULADD_MEM_FN: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+    static MUL_MEM_INPLACE_FN: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+
+    // Scalar fallbacks
+    unsafe fn mul_mem_scalar(dst: &mut [u8], src: &[u8], coeff: u8) {
         let table = MUL_TABLES.get(coeff);
-        for i in remainder_start..len {
+        for i in 0..dst.len() {
+            dst[i] = table[src[i] as usize];
+        }
+    }
+
+    unsafe fn muladd_mem_scalar(dst: &mut [u8], src: &[u8], coeff: u8) {
+        let table = MUL_TABLES.get(coeff);
+        for i in 0..dst.len() {
+            dst[i] ^= table[src[i] as usize];
+        }
+    }
+
+    unsafe fn mul_mem_inplace_scalar(dst: &mut [u8], coeff: u8) {
+        let table = MUL_TABLES.get(coeff);
+        for i in 0..dst.len() {
             dst[i] = table[dst[i] as usize];
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn init_dispatch() {
+        let (mul, muladd, inplace): (MulMemFn, MulAddMemFn, MulMemInplaceFn) =
+            if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f") {
+                (
+                    gf256_mul_mem_avx512,
+                    gf256_muladd_mem_avx512,
+                    gf256_mul_mem_inplace_avx512,
+                )
+            } else if is_x86_feature_detected!("avx2") {
+                (
+                    gf256_mul_mem_avx2,
+                    gf256_muladd_mem_avx2,
+                    gf256_mul_mem_inplace_avx2,
+                )
+            } else if is_x86_feature_detected!("ssse3") {
+                (
+                    gf256_mul_mem_ssse3,
+                    gf256_muladd_mem_ssse3,
+                    gf256_mul_mem_inplace_ssse3,
+                )
+            } else {
+                (mul_mem_scalar, muladd_mem_scalar, mul_mem_inplace_scalar)
+            };
+
+        MUL_MEM_FN.store(mul as *mut (), Ordering::Release);
+        MULADD_MEM_FN.store(muladd as *mut (), Ordering::Release);
+        MUL_MEM_INPLACE_FN.store(inplace as *mut (), Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn gf256_mul_mem_dispatch(dst: &mut [u8], src: &[u8], coeff: u8) {
+        let ptr = MUL_MEM_FN.load(Ordering::Relaxed);
+        let func = if ptr.is_null() {
+            init_dispatch();
+            MUL_MEM_FN.load(Ordering::Acquire)
+        } else {
+            ptr
+        };
+        unsafe { std::mem::transmute::<*mut (), MulMemFn>(func)(dst, src, coeff) }
+    }
+
+    #[inline(always)]
+    pub fn gf256_muladd_mem_dispatch(dst: &mut [u8], src: &[u8], coeff: u8) {
+        let ptr = MULADD_MEM_FN.load(Ordering::Relaxed);
+        let func = if ptr.is_null() {
+            init_dispatch();
+            MULADD_MEM_FN.load(Ordering::Acquire)
+        } else {
+            ptr
+        };
+        unsafe { std::mem::transmute::<*mut (), MulAddMemFn>(func)(dst, src, coeff) }
+    }
+
+    #[inline(always)]
+    pub fn gf256_mul_mem_inplace_dispatch(dst: &mut [u8], coeff: u8) {
+        let ptr = MUL_MEM_INPLACE_FN.load(Ordering::Relaxed);
+        let func = if ptr.is_null() {
+            init_dispatch();
+            MUL_MEM_INPLACE_FN.load(Ordering::Acquire)
+        } else {
+            ptr
+        };
+        unsafe { std::mem::transmute::<*mut (), MulMemInplaceFn>(func)(dst, coeff) }
     }
 }
 
@@ -1457,10 +1551,10 @@ pub(crate) fn gf256_mul_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
         return;
     }
 
-    // Use x86 SIMD when compiled with SSSE3
-    #[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "ssse3"))]
+    // Use x86 SIMD with runtime detection
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
-        unsafe { simd::gf256_mul_mem_simd(dst, src, coeff.0) };
+        simd_x86::gf256_mul_mem_dispatch(dst, src, coeff.0);
         return;
     }
 
@@ -1478,11 +1572,11 @@ pub(crate) fn gf256_mul_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
         return;
     }
 
-    // Scalar fallback (when SIMD feature disabled or no SIMD available)
+    // Scalar fallback
     #[cfg(not(all(
         feature = "simd",
         any(
-            all(target_arch = "x86_64", target_feature = "ssse3"),
+            target_arch = "x86_64",
             target_arch = "aarch64",
             all(target_arch = "wasm32", target_feature = "simd128")
         )
@@ -1510,10 +1604,10 @@ pub(crate) fn gf256_muladd_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
         return;
     }
 
-    // Use x86 SIMD when compiled with SSSE3
-    #[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "ssse3"))]
+    // Use x86 SIMD with runtime detection
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
-        unsafe { simd::gf256_muladd_mem_simd(dst, src, coeff.0) };
+        simd_x86::gf256_muladd_mem_dispatch(dst, src, coeff.0);
         return;
     }
 
@@ -1531,11 +1625,11 @@ pub(crate) fn gf256_muladd_mem(dst: &mut [u8], src: &[u8], coeff: Gf256) {
         return;
     }
 
-    // Scalar fallback (when SIMD feature disabled or no SIMD available)
+    // Scalar fallback
     #[cfg(not(all(
         feature = "simd",
         any(
-            all(target_arch = "x86_64", target_feature = "ssse3"),
+            target_arch = "x86_64",
             target_arch = "aarch64",
             all(target_arch = "wasm32", target_feature = "simd128")
         )
@@ -1609,10 +1703,10 @@ pub(crate) fn gf256_mul_mem_inplace(dst: &mut [u8], coeff: Gf256) {
         return;
     }
 
-    // Use x86 SIMD when compiled with SSSE3
-    #[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "ssse3"))]
+    // Use x86 SIMD with runtime detection (SSSE3/AVX2)
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
-        unsafe { simd::gf256_mul_mem_inplace_simd(dst, coeff.0) };
+        simd_x86::gf256_mul_mem_inplace_dispatch(dst, coeff.0);
         return;
     }
 
@@ -1634,7 +1728,7 @@ pub(crate) fn gf256_mul_mem_inplace(dst: &mut [u8], coeff: Gf256) {
     #[cfg(not(all(
         feature = "simd",
         any(
-            all(target_arch = "x86_64", target_feature = "ssse3"),
+            target_arch = "x86_64",
             target_arch = "aarch64",
             all(target_arch = "wasm32", target_feature = "simd128")
         )

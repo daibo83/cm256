@@ -25,7 +25,7 @@ fi
 # Run C++ benchmark
 if [ "$ARCH" = "x86_64" ]; then
     echo "----------------------------------------------"
-    echo "C++ + AVX2 (original, -march=native)"
+    echo "C++ (original, -march=native)"
     echo "----------------------------------------------"
 elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
     echo "----------------------------------------------"
@@ -45,45 +45,11 @@ echo "----------------------------------------------"
 cargo run --release --no-default-features --example benchmark 2>/dev/null
 echo ""
 
-# x86_64 specific benchmarks
-if [ "$ARCH" = "x86_64" ]; then
-    echo "----------------------------------------------"
-    echo "Rust + SSE3 (SSSE3)"
-    echo "----------------------------------------------"
-    RUSTFLAGS="-C target-feature=+ssse3" cargo run --release --example benchmark 2>/dev/null
-    echo ""
-
-    echo "----------------------------------------------"
-    echo "Rust + AVX2"
-    echo "----------------------------------------------"
-    RUSTFLAGS="-C target-feature=+avx2,+ssse3" cargo run --release --example benchmark 2>/dev/null
-    echo ""
-
-    # Check for AVX-512 support
-    if grep -q avx512bw /proc/cpuinfo 2>/dev/null; then
-        echo "----------------------------------------------"
-        echo "Rust + AVX-512 (native CPU)"
-        echo "----------------------------------------------"
-        RUSTFLAGS="-C target-cpu=native" cargo run --release --example benchmark 2>/dev/null
-        echo ""
-    fi
-fi
-
-# ARM/aarch64 specific benchmarks
-if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-    echo "----------------------------------------------"
-    echo "Rust + NEON (native CPU)"
-    echo "----------------------------------------------"
-    RUSTFLAGS="-C target-cpu=native" cargo run --release --example benchmark 2>/dev/null
-    echo ""
-else
-    echo "----------------------------------------------"
-    echo "Rust + NEON (aarch64)"
-    echo "----------------------------------------------"
-    echo "⚠️  NEON benchmark skipped: not running on ARM"
-    echo "   To run on ARM: use aarch64/arm64 hardware"
-    echo ""
-fi
+echo "----------------------------------------------"
+echo "Rust + Runtime SIMD Detection (auto-selects best)"
+echo "----------------------------------------------"
+cargo run --release --example benchmark 2>/dev/null
+echo ""
 
 # WASM SIMD benchmark
 echo "----------------------------------------------"
@@ -110,11 +76,13 @@ if [ "$ARCH" = "x86_64" ]; then
     echo "----------------------------------------------"
     echo "Erasure Code Comparison (CM256 vs RaptorQ vs Wirehair)"
     echo "----------------------------------------------"
-    echo "(Using AVX2 for CM256 for fair comparison)"
-    RUSTFLAGS="-C target-feature=+avx2,+ssse3" cargo run --release --features compare --example compare_raptorq 2>/dev/null
+    cargo run --release --features compare --example compare_raptorq 2>/dev/null
     echo ""
 fi
 
 echo "=============================================="
 echo "Benchmark complete!"
+echo ""
+echo "Runtime SIMD detection automatically selects the best"
+echo "available: AVX-512 > AVX2 > SSSE3 > NEON > scalar"
 echo "=============================================="

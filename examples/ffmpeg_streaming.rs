@@ -6,6 +6,8 @@
 //!
 //! # Usage
 //!
+//! ## UDP Transport (default)
+//!
 //! Receiver (start first):
 //! ```bash
 //! cargo run --release --example ffmpeg_streaming -- recv | ffplay -f h264 -
@@ -17,6 +19,19 @@
 //!     cargo run --release --example ffmpeg_streaming -- send
 //! ```
 //!
+//! ## QUIC Transport
+//!
+//! Receiver (start first, acts as QUIC server):
+//! ```bash
+//! cargo run --release --example ffmpeg_streaming -- recv --transport quic | ffplay -f h264 -
+//! ```
+//!
+//! Sender (QUIC client):
+//! ```bash
+//! ffmpeg -re -i input.mp4 -c:v libx264 -tune zerolatency -f h264 - | \
+//!     cargo run --release --example ffmpeg_streaming -- send --transport quic
+//! ```
+//!
 //! # Key Differences from Block FEC (ffmpeg_pipe)
 //!
 //! - **Lower latency**: Parities are generated per-packet, not per-message
@@ -24,33 +39,196 @@
 //! - **Continuous protection**: Every packet is covered by multiple parity windows
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use cm256::streaming::{StreamingDecoder, StreamingEncoder, StreamingParams};
+use cm256::transport::{AsyncDatagramRecv, AsyncDatagramSend};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn, Level};
 
 // ============================================================================
-// Packet Format
+// Transport Abstraction
 // ============================================================================
 
+/// Transport type selection
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum TransportType {
+    /// UDP transport (default)
+    #[default]
+    Udp,
+    /// QUIC transport (uses unreliable datagrams)
+    Quic,
+}
+
+/// Unified transport enum that implements async datagram traits
+enum Transport {
+    Udp(UdpSocket),
+    Quic(quinn::Connection),
+}
+
+impl AsyncDatagramSend for Transport {
+    fn send_datagram_async<'a>(
+        &'a self,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        match self {
+            Transport::Udp(socket) => Box::pin(async move { socket.send(data).await }),
+            Transport::Quic(conn) => Box::pin(async move {
+                let bytes = bytes::Bytes::copy_from_slice(data);
+                conn.send_datagram(bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                Ok(data.len())
+            }),
+        }
+    }
+}
+
+impl AsyncDatagramRecv for Transport {
+    fn recv_datagram_async<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        match self {
+            Transport::Udp(socket) => Box::pin(async move { socket.recv(buf).await }),
+            Transport::Quic(conn) => Box::pin(async move {
+                let datagram = conn
+                    .read_datagram()
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let len = datagram.len().min(buf.len());
+                buf[..len].copy_from_slice(&datagram[..len]);
+                Ok(len)
+            }),
+        }
+    }
+}
+
+// ============================================================================
+// QUIC Setup Helpers
+// ============================================================================
+
+/// Generate self-signed certificate for QUIC
+fn generate_self_signed_cert() -> Result<(
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .context("Failed to generate self-signed certificate")?;
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+    let cert = cert.cert.into();
+    Ok((cert, key))
+}
+
+/// Create QUIC server config with self-signed cert
+fn make_server_config() -> Result<quinn::ServerConfig> {
+    let (cert, key) = generate_self_signed_cert()?;
+
+    let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)
+        .context("Failed to create server config")?;
+
+    // Enable datagrams
+    let transport = Arc::get_mut(&mut server_config.transport).unwrap();
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+    transport.datagram_receive_buffer_size(Some(65536));
+
+    Ok(server_config)
+}
+
+/// Create QUIC client config (skip server verification for demo)
+fn make_client_config() -> Result<quinn::ClientConfig> {
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+                .with_no_client_auth(),
+        )
+        .unwrap(),
+    ));
+
+    // Enable datagrams
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+    transport.datagram_receive_buffer_size(Some(65536));
+    client_config.transport_config(Arc::new(transport));
+
+    Ok(client_config)
+}
+
+/// Skip server certificate verification (for demo purposes only)
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+// ============================================================================
+// Packet Header (for manual encoding when using raw transport)
+// ============================================================================
+
+/// Packet type discriminator
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PacketType {
+    Source = 0,
+    Parity = 1,
+}
+
 /// Packet header for streaming FEC
-///
-/// Format:
-/// - bytes 0-1: sequence number (u16, little-endian)
-/// - byte 2: packet type (0 = source, 1 = parity)
-/// - byte 3: parity index (for parity packets) or flags (for source)
-/// - bytes 4-5: parity end_seq (for parity packets) or data length (for source)
-/// - bytes 6-7: reserved
 #[derive(Debug, Clone, Copy)]
 struct PacketHeader {
     seq: u16,
-    is_parity: bool,
+    packet_type: PacketType,
     parity_index: u8,
-    parity_end_seq: u16,
-    data_len: u16,
+    aux_field: u16, // data_len for source, end_seq for parity
 }
 
 impl PacketHeader {
@@ -59,33 +237,27 @@ impl PacketHeader {
     fn source(seq: u16, data_len: u16) -> Self {
         Self {
             seq,
-            is_parity: false,
+            packet_type: PacketType::Source,
             parity_index: 0,
-            parity_end_seq: 0,
-            data_len,
+            aux_field: data_len,
         }
     }
 
     fn parity(seq: u16, parity_index: u8, end_seq: u16) -> Self {
         Self {
             seq,
-            is_parity: true,
+            packet_type: PacketType::Parity,
             parity_index,
-            parity_end_seq: end_seq,
-            data_len: 0,
+            aux_field: end_seq,
         }
     }
 
     fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0..2].copy_from_slice(&self.seq.to_le_bytes());
-        buf[2] = if self.is_parity { 1 } else { 0 };
+        buf[2] = self.packet_type as u8;
         buf[3] = self.parity_index;
-        if self.is_parity {
-            buf[4..6].copy_from_slice(&self.parity_end_seq.to_le_bytes());
-        } else {
-            buf[4..6].copy_from_slice(&self.data_len.to_le_bytes());
-        }
+        buf[4..6].copy_from_slice(&self.aux_field.to_le_bytes());
         buf
     }
 
@@ -94,16 +266,19 @@ impl PacketHeader {
             return None;
         }
         let seq = u16::from_le_bytes([buf[0], buf[1]]);
-        let is_parity = buf[2] != 0;
+        let packet_type = match buf[2] {
+            0 => PacketType::Source,
+            1 => PacketType::Parity,
+            _ => return None,
+        };
         let parity_index = buf[3];
-        let field = u16::from_le_bytes([buf[4], buf[5]]);
+        let aux_field = u16::from_le_bytes([buf[4], buf[5]]);
 
         Some(Self {
             seq,
-            is_parity,
+            packet_type,
             parity_index,
-            parity_end_seq: if is_parity { field } else { 0 },
-            data_len: if is_parity { 0 } else { field },
+            aux_field,
         })
     }
 }
@@ -135,6 +310,10 @@ enum Command {
         #[arg(short, long, default_value = "127.0.0.1:9001")]
         remote: SocketAddr,
 
+        /// Transport type (udp or quic)
+        #[arg(long, default_value = "udp")]
+        transport: TransportType,
+
         /// FEC delay (window size in packets)
         #[arg(long, default_value = "15")]
         delay: u8,
@@ -143,7 +322,7 @@ enum Command {
         #[arg(long, default_value = "1")]
         parities: u8,
 
-        /// Step size (generate parities every N packets). Lower = more overlap, higher overhead.
+        /// Step size (generate parities every N packets)
         #[arg(long, default_value = "5")]
         step_size: u8,
 
@@ -156,6 +335,10 @@ enum Command {
         /// Local address to bind to
         #[arg(short, long, default_value = "0.0.0.0:9001")]
         listen: SocketAddr,
+
+        /// Transport type (udp or quic)
+        #[arg(long, default_value = "udp")]
+        transport: TransportType,
 
         /// FEC delay (must match sender)
         #[arg(long, default_value = "15")]
@@ -182,6 +365,7 @@ enum Command {
 async fn run_sender(
     addr: SocketAddr,
     remote: SocketAddr,
+    transport_type: TransportType,
     delay: u8,
     parities: u8,
     step_size: u8,
@@ -191,8 +375,8 @@ async fn run_sender(
         .context("Invalid streaming parameters")?;
 
     info!(
-        "Streaming Sender: {} -> {}, delay={}, parities={}, step_size={}, packet_size={}",
-        addr, remote, delay, parities, step_size, packet_size
+        "Streaming Sender: {} -> {}, transport={:?}, delay={}, parities={}, step_size={}, packet_size={}",
+        addr, remote, transport_type, delay, parities, step_size, packet_size
     );
     info!(
         "  Max burst recovery: {} packets, overhead: {:.1}%",
@@ -200,14 +384,51 @@ async fn run_sender(
         params.overhead() * 100.0
     );
 
-    let socket = UdpSocket::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind to {}", addr))?;
+    // Create transport based on type
+    let transport = match transport_type {
+        TransportType::Udp => {
+            let socket = UdpSocket::bind(addr)
+                .await
+                .with_context(|| format!("Failed to bind to {}", addr))?;
+            socket
+                .connect(remote)
+                .await
+                .with_context(|| format!("Failed to connect to {}", remote))?;
+            info!("UDP socket connected to {}", remote);
+            Transport::Udp(socket)
+        }
+        TransportType::Quic => {
+            let client_config = make_client_config()?;
+            let mut endpoint = quinn::Endpoint::client(addr)
+                .with_context(|| format!("Failed to bind QUIC endpoint to {}", addr))?;
+            endpoint.set_default_client_config(client_config);
+
+            info!("Connecting to QUIC server at {}...", remote);
+            let connection = endpoint
+                .connect(remote, "localhost")
+                .context("Failed to start QUIC connection")?
+                .await
+                .context("Failed to establish QUIC connection")?;
+            info!("QUIC connection established, waiting for receiver ready signal...");
+
+            // Wait for receiver to signal it's ready
+            let ready = connection
+                .read_datagram()
+                .await
+                .context("Failed to receive ready signal")?;
+            if &ready[..] != b"READY" {
+                anyhow::bail!("Unexpected ready signal: {:?}", ready);
+            }
+            info!("Receiver ready, starting stream");
+
+            Transport::Quic(connection)
+        }
+    };
 
     let mut encoder = StreamingEncoder::new(params);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
 
-    // Stdin reader thread - reads fixed-size chunks
+    // Stdin reader thread
     let pkt_size = packet_size;
     std::thread::spawn(move || {
         let stdin = io::stdin();
@@ -215,21 +436,16 @@ async fn run_sender(
         let mut buffer = vec![0u8; pkt_size];
 
         loop {
-            // Read exactly packet_size bytes (or less at EOF)
             let mut total_read = 0;
             while total_read < pkt_size {
                 match handle.read(&mut buffer[total_read..]) {
                     Ok(0) => {
-                        // EOF
                         if total_read > 0 {
-                            // Send partial final packet
                             let _ = tx.blocking_send(buffer[..total_read].to_vec());
                         }
                         return;
                     }
-                    Ok(n) => {
-                        total_read += n;
-                    }
+                    Ok(n) => total_read += n,
                     Err(e) => {
                         eprintln!("stdin read error: {}", e);
                         return;
@@ -242,6 +458,7 @@ async fn run_sender(
         }
     });
 
+    let mut send_buffer = Vec::with_capacity(PacketHeader::SIZE + packet_size);
     let mut source_count = 0u64;
     let mut parity_count = 0u64;
     let mut total_bytes = 0u64;
@@ -249,41 +466,34 @@ async fn run_sender(
     while let Some(data) = rx.recv().await {
         let actual_len = data.len();
 
-        // Pad to packet_size for FEC (streaming FEC needs fixed-size symbols)
+        // Pad to packet_size for FEC
         let mut padded = data;
         if padded.len() < packet_size {
             padded.resize(packet_size, 0);
         }
 
-        // Encode with streaming FEC
         let result = encoder.add_source(&padded);
 
         // Send source packet
         let header = PacketHeader::source(result.source_seq, actual_len as u16);
-        let mut packet = Vec::with_capacity(PacketHeader::SIZE + packet_size);
-        packet.extend_from_slice(&header.to_bytes());
-        packet.extend_from_slice(&padded);
-
-        socket.send_to(&packet, remote).await?;
+        send_buffer.clear();
+        send_buffer.extend_from_slice(&header.to_bytes());
+        send_buffer.extend_from_slice(&padded);
+        transport.send_datagram_async(&send_buffer).await?;
         source_count += 1;
         total_bytes += actual_len as u64;
 
         // Send parity packets
         for parity in &result.parities {
-            let header = PacketHeader::parity(
-                result.source_seq, // Use source seq for ordering
-                parity.parity_index,
-                parity.end_seq,
-            );
-            let mut packet = Vec::with_capacity(PacketHeader::SIZE + packet_size);
-            packet.extend_from_slice(&header.to_bytes());
-            packet.extend_from_slice(&parity.data);
-
-            socket.send_to(&packet, remote).await?;
+            let header =
+                PacketHeader::parity(result.source_seq, parity.parity_index, parity.end_seq);
+            send_buffer.clear();
+            send_buffer.extend_from_slice(&header.to_bytes());
+            send_buffer.extend_from_slice(&parity.data);
+            transport.send_datagram_async(&send_buffer).await?;
             parity_count += 1;
         }
 
-        // Small delay to prevent overwhelming the network
         if source_count % 4 == 0 {
             tokio::time::sleep(tokio::time::Duration::from_micros(50)).await;
         }
@@ -294,6 +504,18 @@ async fn run_sender(
                 source_count, parity_count, total_bytes
             );
         }
+    }
+
+    // Flush remaining parities
+    let flush_parities = encoder.flush();
+    let seq = encoder.next_seq().wrapping_sub(1);
+    for parity in &flush_parities {
+        let header = PacketHeader::parity(seq, parity.parity_index, parity.end_seq);
+        send_buffer.clear();
+        send_buffer.extend_from_slice(&header.to_bytes());
+        send_buffer.extend_from_slice(&parity.data);
+        transport.send_datagram_async(&send_buffer).await?;
+        parity_count += 1;
     }
 
     info!(
@@ -309,6 +531,7 @@ async fn run_sender(
 
 async fn run_receiver(
     addr: SocketAddr,
+    transport_type: TransportType,
     delay: u8,
     parities: u8,
     step_size: u8,
@@ -318,19 +541,48 @@ async fn run_receiver(
         .context("Invalid streaming parameters")?;
 
     info!(
-        "Streaming Receiver on {}, delay={}, parities={}, step_size={}, packet_size={}",
-        addr, delay, parities, step_size, packet_size
+        "Streaming Receiver on {}, transport={:?}, delay={}, parities={}, step_size={}, packet_size={}",
+        addr, transport_type, delay, parities, step_size, packet_size
     );
 
-    let socket = UdpSocket::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind to {}", addr))?;
+    let mut recv_buffer = vec![0u8; 65536];
+
+    // Create transport based on type, capturing first packet for UDP
+    let (transport, first_packet_len) = match transport_type {
+        TransportType::Udp => {
+            let socket = UdpSocket::bind(addr)
+                .await
+                .with_context(|| format!("Failed to bind to {}", addr))?;
+
+            // Wait for first packet to get sender address, then connect
+            info!("Waiting for UDP connection...");
+            let (n, sender_addr) = socket.recv_from(&mut recv_buffer).await?;
+            info!("Connected to sender at {}", sender_addr);
+            socket.connect(sender_addr).await?;
+            (Transport::Udp(socket), Some(n))
+        }
+        TransportType::Quic => {
+            let server_config = make_server_config()?;
+            let endpoint = quinn::Endpoint::server(server_config, addr)
+                .with_context(|| format!("Failed to bind QUIC endpoint to {}", addr))?;
+
+            info!("Waiting for QUIC connection...");
+            let incoming = endpoint
+                .accept()
+                .await
+                .context("No incoming QUIC connection")?;
+            let connection = incoming.await.context("Failed to accept QUIC connection")?;
+            info!(
+                "QUIC connection established from {}",
+                connection.remote_address()
+            );
+            // Note: We'll send the ready signal after setup is complete
+            (Transport::Quic(connection), None)
+        }
+    };
 
     let mut decoder = StreamingDecoder::new(params);
-    // Keep more history for recovery
     decoder.set_history_windows(16);
-
-    let mut recv_buffer = vec![0u8; 65536];
 
     // Channels for output ordering
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<(u16, Vec<u8>)>(1000);
@@ -349,7 +601,6 @@ async fn run_receiver(
             total_bytes += data.len() as u64;
             msg_count += 1;
 
-            // Batch writes
             while let Ok(more_data) = write_rx.try_recv() {
                 if stdout.write_all(&more_data).is_err() {
                     return;
@@ -365,7 +616,16 @@ async fn run_receiver(
         }
     });
 
-    // Ordering task - reorders packets by sequence number
+    // For QUIC, send ready signal now that we're set up
+    if matches!(transport_type, TransportType::Quic) {
+        info!("Sending ready signal to sender...");
+        transport
+            .send_datagram_async(b"READY")
+            .await
+            .context("Failed to send ready signal")?;
+    }
+
+    // Ordering task
     tokio::task::spawn(async move {
         let mut output_queue: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
         let mut next_seq: u16 = 0;
@@ -379,7 +639,6 @@ async fn run_receiver(
 
             output_queue.insert(seq, data);
 
-            // Output in-order packets
             while let Some(data) = output_queue.remove(&next_seq) {
                 if write_tx.send(data).is_err() {
                     return;
@@ -387,12 +646,10 @@ async fn run_receiver(
                 next_seq = next_seq.wrapping_add(1);
             }
 
-            // Handle queue overflow (skip ahead if too far behind)
             if output_queue.len() > 200 {
                 if let Some(&first_seq) = output_queue.keys().next() {
                     let gap = first_seq.wrapping_sub(next_seq);
                     if gap < 32768 {
-                        // first_seq is ahead
                         eprintln!(
                             "WARN: Queue overflow, skipping {} -> {}",
                             next_seq, first_seq
@@ -414,66 +671,103 @@ async fn run_receiver(
     let mut source_count = 0u64;
     let mut parity_count = 0u64;
     let mut recovered_count = 0u64;
-
-    // Track data lengths for each sequence (source packets include actual length)
     let mut data_lengths: std::collections::HashMap<u16, u16> = std::collections::HashMap::new();
 
-    loop {
-        let n = socket.recv(&mut recv_buffer).await?;
-        packet_count += 1;
-
+    // Helper closure to process a single packet
+    let process_packet = |n: usize,
+                          recv_buffer: &[u8],
+                          decoder: &mut StreamingDecoder,
+                          data_lengths: &mut std::collections::HashMap<u16, u16>,
+                          output_tx: &tokio::sync::mpsc::Sender<(u16, Vec<u8>)>,
+                          source_count: &mut u64,
+                          parity_count: &mut u64| {
         if n < PacketHeader::SIZE {
-            continue;
+            return;
         }
 
         let Some(header) = PacketHeader::from_bytes(&recv_buffer[..PacketHeader::SIZE]) else {
-            continue;
+            return;
         };
 
         let payload = &recv_buffer[PacketHeader::SIZE..n];
-        if payload.len() != packet_size {
-            // Pad if needed (shouldn't happen normally)
-            continue;
+        if payload.len() < packet_size {
+            return;
         }
 
-        if header.is_parity {
-            // Parity packet
-            decoder.add_parity(header.parity_end_seq, header.parity_index, payload);
-            parity_count += 1;
+        match header.packet_type {
+            PacketType::Source => {
+                decoder.add_source(header.seq, &payload[..packet_size]);
+                data_lengths.insert(header.seq, header.aux_field);
+                *source_count += 1;
 
-            debug!(
-                "RX parity: end_seq={}, index={}",
-                header.parity_end_seq, header.parity_index
-            );
-        } else {
-            // Source packet
-            decoder.add_source(header.seq, payload);
-            data_lengths.insert(header.seq, header.data_len);
-            source_count += 1;
+                debug!("RX source: seq={}, len={}", header.seq, header.aux_field);
 
-            debug!("RX source: seq={}, len={}", header.seq, header.data_len);
-
-            // Output immediately if we have this source
-            let actual_len = header.data_len as usize;
-            let data = payload[..actual_len.min(packet_size)].to_vec();
-            if output_tx.try_send((header.seq, data)).is_err() {
-                warn!("Output buffer full, dropping packet {}", header.seq);
+                let actual_len = header.aux_field as usize;
+                let data = payload[..actual_len.min(packet_size)].to_vec();
+                if output_tx.try_send((header.seq, data)).is_err() {
+                    warn!("Output buffer full, dropping packet {}", header.seq);
+                }
+            }
+            PacketType::Parity => {
+                decoder.add_parity(
+                    header.aux_field,
+                    header.parity_index,
+                    &payload[..packet_size],
+                );
+                *parity_count += 1;
+                debug!(
+                    "RX parity: end_seq={}, index={}",
+                    header.aux_field, header.parity_index
+                );
             }
         }
+    };
+
+    // Process the first packet that was received during UDP connection setup
+    if let Some(n) = first_packet_len {
+        process_packet(
+            n,
+            &recv_buffer,
+            &mut decoder,
+            &mut data_lengths,
+            &output_tx,
+            &mut source_count,
+            &mut parity_count,
+        );
+        packet_count += 1;
+    }
+
+    loop {
+        let n = match transport.recv_datagram_async(&mut recv_buffer).await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("Receive error: {}", e);
+                continue;
+            }
+        };
+
+        packet_count += 1;
+
+        process_packet(
+            n,
+            &recv_buffer,
+            &mut decoder,
+            &mut data_lengths,
+            &output_tx,
+            &mut source_count,
+            &mut parity_count,
+        );
 
         // Try recovery periodically
         if packet_count % 4 == 0 {
             let recovered = decoder.try_recover();
             for (seq, data) in recovered {
                 recovered_count += 1;
-
-                // Get actual data length (default to full packet if unknown)
                 let actual_len = data_lengths
                     .get(&seq)
                     .copied()
                     .unwrap_or(packet_size as u16) as usize;
                 let trimmed = data[..actual_len.min(packet_size)].to_vec();
-
                 debug!("Recovered seq={}, len={}", seq, actual_len);
 
                 if output_tx.try_send((seq, trimmed)).is_err() {
@@ -524,18 +818,31 @@ async fn main() -> Result<()> {
         Command::Send {
             listen,
             remote,
+            transport,
             delay,
             parities,
             step_size,
             packet_size,
-        } => run_sender(listen, remote, delay, parities, step_size, packet_size).await?,
+        } => {
+            run_sender(
+                listen,
+                remote,
+                transport,
+                delay,
+                parities,
+                step_size,
+                packet_size,
+            )
+            .await?
+        }
         Command::Recv {
             listen,
+            transport,
             delay,
             parities,
             step_size,
             packet_size,
-        } => run_receiver(listen, delay, parities, step_size, packet_size).await?,
+        } => run_receiver(listen, transport, delay, parities, step_size, packet_size).await?,
     }
 
     Ok(())
