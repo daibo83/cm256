@@ -45,6 +45,9 @@ pub struct SenderArq {
 
     /// Maximum retransmit attempts per packet.
     max_retries: u8,
+
+    /// Total number of retransmissions.
+    total_retransmits: u64,
 }
 
 impl SenderArq {
@@ -56,6 +59,7 @@ impl SenderArq {
             base_seq: 0,
             next_seq: 0,
             max_retries,
+            total_retransmits: 0,
         }
     }
 
@@ -67,6 +71,11 @@ impl SenderArq {
     /// Get the base sequence (oldest unacked).
     pub fn base_seq(&self) -> u16 {
         self.base_seq
+    }
+
+    /// Get total number of retransmissions.
+    pub fn total_retransmits(&self) -> u64 {
+        self.total_retransmits
     }
 
     /// Get the number of packets in flight (sent but not acked).
@@ -127,15 +136,21 @@ impl SenderArq {
     /// Returns None if the packet is not in the buffer or max retries exceeded.
     pub fn get_retransmit_data(&mut self, seq: u16) -> Option<Vec<u8>> {
         let max_retries = self.max_retries;
-        let pkt = self.find_packet_mut(seq)?;
 
-        if pkt.retransmit_count >= max_retries {
-            return None;
+        {
+            let pkt = self.find_packet_mut(seq)?;
+
+            if pkt.retransmit_count >= max_retries {
+                return None;
+            }
+
+            pkt.retransmit_count += 1;
+            pkt.send_time = Instant::now();
         }
 
-        pkt.retransmit_count += 1;
-        pkt.send_time = Instant::now();
+        self.total_retransmits += 1;
 
+        let pkt = self.find_packet_mut(seq)?;
         Some(pkt.data.clone())
     }
 
@@ -186,6 +201,7 @@ impl SenderArq {
         self.send_buffer.clear();
         self.base_seq = 0;
         self.next_seq = 0;
+        self.total_retransmits = 0;
     }
 }
 

@@ -321,6 +321,7 @@ async fn run_sender(
 
     let mut source_count = 0u64;
     let mut total_bytes = 0u64;
+    let mut last_retransmits = 0u64;
     let start_time = std::time::Instant::now();
 
     while let Some(data) = rx.recv().await {
@@ -346,19 +347,19 @@ async fn run_sender(
 
         // Print stats periodically
         if source_count % 1000 == 0 {
-            let elapsed = start_time.elapsed().as_secs_f64();
             let stats = encoder.stats();
-            let bbr = encoder.bbr();
+            let retransmits = encoder.arq().total_retransmits();
+            let new_retransmits = retransmits - last_retransmits;
+            last_retransmits = retransmits;
 
             info!(
-                "TX: {} pkts, {:.1} MB, {:.1} Mbps | Loss: {:.1}% | RTT: {:.0}ms | BW: {:.1} Mbps | CWND: {}",
+                "TX: {} pkts, {:.1} MB | Loss: {:.1}% | RTT: {:.0}ms | Retransmits: {} (+{})",
                 source_count,
                 total_bytes as f64 / 1_000_000.0,
-                (total_bytes as f64 * 8.0) / elapsed / 1_000_000.0,
                 stats.loss_rate() * 100.0,
                 stats.avg_rtt_ms(),
-                bbr.btl_bw() as f64 * 8.0 / 1_000_000.0,
-                bbr.cwnd(),
+                retransmits,
+                new_retransmits,
             );
         }
     }
@@ -503,8 +504,8 @@ async fn run_receiver(
         }
     });
 
-    let mut packet_count = 0u64;
     let mut source_count = 0u64;
+    let mut parity_count = 0u64;
     let mut recovered_count = 0u64;
     let start_time = std::time::Instant::now();
 
@@ -519,7 +520,6 @@ async fn run_receiver(
         if pkt_type == 0 {
             let payload = first_buf[8..first_len].to_vec();
             debug!("Injected first packet: seq={}, len={}", seq, payload.len());
-            packet_count += 1;
             source_count += 1;
 
             // Also add to FEC decoder for recovery purposes
@@ -545,7 +545,6 @@ async fn run_receiver(
                 data,
                 recovered,
             }) => {
-                packet_count += 1;
                 source_count += 1;
                 if recovered {
                     recovered_count += 1;
@@ -559,7 +558,7 @@ async fn run_receiver(
                 }
             }
             Ok(RecvResult::Parity) => {
-                packet_count += 1;
+                parity_count += 1;
                 debug!("Received parity packet");
             }
             Ok(RecvResult::Ack) => {
@@ -577,18 +576,17 @@ async fn run_receiver(
         }
 
         // Print stats periodically
-        if packet_count % 5000 == 0 && packet_count > 0 {
+        if source_count % 5000 == 0 && source_count > 0 {
             let elapsed = start_time.elapsed().as_secs_f64();
-            let stats = decoder.stats();
+            let overhead = if source_count > 0 {
+                parity_count as f64 / source_count as f64 * 100.0
+            } else {
+                0.0
+            };
 
             info!(
-                "RX: {} pkts ({} src, {} recovered) | {:.1}s | Loss: {:.1}% | RTT: {:.0}ms",
-                packet_count,
-                source_count,
-                recovered_count,
-                elapsed,
-                stats.loss_rate() * 100.0,
-                stats.avg_rtt_ms(),
+                "RX: {} src + {} parity ({:.1}% overhead) | {} recovered by FEC | {:.1}s",
+                source_count, parity_count, overhead, recovered_count, elapsed,
             );
         }
     }
