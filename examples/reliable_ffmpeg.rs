@@ -155,6 +155,18 @@ enum Command {
         /// Symbol/packet size in bytes
         #[arg(long, default_value = "1200")]
         packet_size: usize,
+
+        /// FEC window size (delay in packets)
+        #[arg(long)]
+        fec_delay: Option<u8>,
+
+        /// Number of parity packets per step
+        #[arg(long)]
+        fec_parities: Option<u8>,
+
+        /// Generate parities every N packets (higher = less overhead)
+        #[arg(long)]
+        fec_step: Option<u8>,
     },
     /// Receive stream and output H.264 to stdout
     Recv {
@@ -173,10 +185,28 @@ enum Command {
         /// Symbol/packet size in bytes (must match sender)
         #[arg(long, default_value = "1200")]
         packet_size: usize,
+
+        /// FEC window size (must match sender)
+        #[arg(long)]
+        fec_delay: Option<u8>,
+
+        /// Number of parity packets per step (must match sender)
+        #[arg(long)]
+        fec_parities: Option<u8>,
+
+        /// Generate parities every N packets (must match sender)
+        #[arg(long)]
+        fec_step: Option<u8>,
     },
 }
 
-fn get_config(preset: &str, packet_size: usize) -> Result<ReliableConfig> {
+fn get_config(
+    preset: &str,
+    packet_size: usize,
+    fec_delay: Option<u8>,
+    fec_parities: Option<u8>,
+    fec_step: Option<u8>,
+) -> Result<ReliableConfig> {
     let mut config = match preset {
         "default" => ReliableConfig::default(),
         "low-latency" => ReliableConfig::low_latency(),
@@ -188,6 +218,17 @@ fn get_config(preset: &str, packet_size: usize) -> Result<ReliableConfig> {
         ),
     };
     config.symbol_bytes = packet_size;
+
+    // Override FEC parameters if specified
+    if let Some(delay) = fec_delay {
+        config.fec_delay = delay;
+    }
+    if let Some(parities) = fec_parities {
+        config.fec_parities = parities;
+    }
+    if let Some(step) = fec_step {
+        config.fec_step_size = step;
+    }
     Ok(config)
 }
 
@@ -201,16 +242,22 @@ async fn run_sender(
     loss_percent: u8,
     preset: String,
     packet_size: usize,
+    fec_delay: Option<u8>,
+    fec_parities: Option<u8>,
+    fec_step: Option<u8>,
 ) -> Result<()> {
-    let config = get_config(&preset, packet_size)?;
+    let config = get_config(&preset, packet_size, fec_delay, fec_parities, fec_step)?;
 
     info!(
         "Reliable Sender: {} -> {}, preset={}, packet_size={}, simulated_loss={}%",
         listen, remote, preset, packet_size, loss_percent
     );
     info!(
-        "  FEC: delay={}, parities={}, step={}",
-        config.fec_delay, config.fec_parities, config.fec_step_size
+        "  FEC: delay={}, parities={}, step={} (overhead: {:.1}%)",
+        config.fec_delay,
+        config.fec_parities,
+        config.fec_step_size,
+        config.fec_parities as f64 / config.fec_step_size as f64 * 100.0
     );
     info!(
         "  ARQ: window={}, buffer={}, max_retries={}",
@@ -340,12 +387,22 @@ async fn run_receiver(
     loss_percent: u8,
     preset: String,
     packet_size: usize,
+    fec_delay: Option<u8>,
+    fec_parities: Option<u8>,
+    fec_step: Option<u8>,
 ) -> Result<()> {
-    let config = get_config(&preset, packet_size)?;
+    let config = get_config(&preset, packet_size, fec_delay, fec_parities, fec_step)?;
 
     info!(
         "Reliable Receiver on {}, preset={}, packet_size={}, simulated_loss={}%",
         listen, preset, packet_size, loss_percent
+    );
+    info!(
+        "  FEC: delay={}, parities={}, step={} (overhead: {:.1}%)",
+        config.fec_delay,
+        config.fec_parities,
+        config.fec_step_size,
+        config.fec_parities as f64 / config.fec_step_size as f64 * 100.0
     );
 
     // Create UDP socket
@@ -563,16 +620,41 @@ async fn main() -> Result<()> {
             loss,
             preset,
             packet_size,
+            fec_delay,
+            fec_parities,
+            fec_step,
         } => {
-            run_sender(listen, remote, loss, preset, packet_size).await?;
+            run_sender(
+                listen,
+                remote,
+                loss,
+                preset,
+                packet_size,
+                fec_delay,
+                fec_parities,
+                fec_step,
+            )
+            .await?;
         }
         Command::Recv {
             listen,
             loss,
             preset,
             packet_size,
+            fec_delay,
+            fec_parities,
+            fec_step,
         } => {
-            run_receiver(listen, loss, preset, packet_size).await?;
+            run_receiver(
+                listen,
+                loss,
+                preset,
+                packet_size,
+                fec_delay,
+                fec_parities,
+                fec_step,
+            )
+            .await?;
         }
     }
 

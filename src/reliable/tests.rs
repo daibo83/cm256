@@ -11,7 +11,9 @@ mod tests {
         assert_eq!(config.window_size, 64);
         assert_eq!(config.ack_every_n_packets, 8);
         assert_eq!(config.fec_delay, 8);
-        assert_eq!(config.fec_parities, 2);
+        assert_eq!(config.fec_parities, 1);
+        assert_eq!(config.fec_step_size, 8);
+        // Default overhead: 1/8 = 12.5%
     }
 
     #[test]

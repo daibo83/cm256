@@ -125,10 +125,11 @@ impl Default for ReliableConfig {
             min_ack_interval_ms: 5,
             window_size: 64,
 
-            // FEC: aggressive for low latency
+            // FEC: balanced for typical networks (~12.5% overhead)
+            // Can recover 1 loss per 8 packets
             fec_delay: 8,
-            fec_parities: 2,
-            fec_step_size: 4,
+            fec_parities: 1,
+            fec_step_size: 8,
             symbol_bytes: 1200,
 
             // ARQ
@@ -144,15 +145,16 @@ impl Default for ReliableConfig {
 
 impl ReliableConfig {
     /// Configuration optimized for ultra-low latency (VoIP, gaming).
+    /// Higher FEC overhead (~25%) for faster recovery, minimal ARQ.
     pub fn low_latency() -> Self {
         Self {
             ack_every_n_packets: 4,
             ack_interval_ms: 10,
             min_ack_interval_ms: 3,
             window_size: 64,
-            fec_delay: 6,
-            fec_parities: 2,
-            fec_step_size: 3,
+            fec_delay: 4,
+            fec_parities: 1,
+            fec_step_size: 4,
             symbol_bytes: 1200,
             send_buffer_size: 64,
             max_retries: 1,
@@ -162,6 +164,7 @@ impl ReliableConfig {
     }
 
     /// Configuration optimized for high throughput (file transfer).
+    /// Lower FEC overhead (~6.25%), relies more on ARQ.
     pub fn high_throughput() -> Self {
         Self {
             ack_every_n_packets: 32,
@@ -169,8 +172,8 @@ impl ReliableConfig {
             min_ack_interval_ms: 20,
             window_size: 64,
             fec_delay: 16,
-            fec_parities: 2,
-            fec_step_size: 8,
+            fec_parities: 1,
+            fec_step_size: 16,
             symbol_bytes: 1400,
             send_buffer_size: 256,
             max_retries: 3,
@@ -180,14 +183,15 @@ impl ReliableConfig {
     }
 
     /// Configuration for high-RTT networks (satellite, intercontinental).
+    /// More aggressive FEC (~25%) to avoid costly retransmissions.
     pub fn high_rtt() -> Self {
         Self {
             ack_every_n_packets: 64,
             ack_interval_ms: 200,
             min_ack_interval_ms: 50,
             window_size: 64,
-            fec_delay: 16,
-            fec_parities: 3,
+            fec_delay: 8,
+            fec_parities: 2,
             fec_step_size: 8,
             symbol_bytes: 1200,
             send_buffer_size: 512,
