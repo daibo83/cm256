@@ -1,148 +1,55 @@
-//! Tests for the reliable transport module.
+//! Tests for the simplified reliable transport module.
 
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use crate::transport::MemoryChannel;
 
     #[test]
     fn test_config_default() {
         let config = ReliableConfig::default();
-        assert_eq!(config.window_size, 64);
-        assert_eq!(config.ack_every_n_packets, 8);
         assert_eq!(config.fec_delay, 8);
-        assert_eq!(config.fec_parities, 1);
+        assert_eq!(config.fec_parities, 2);
         assert_eq!(config.fec_step_size, 8);
-        // Default overhead: 1/8 = 12.5%
+        assert_eq!(config.ack_every_n_packets, 8);
     }
 
     #[test]
     fn test_config_presets() {
         let low_latency = ReliableConfig::low_latency();
-        assert!(low_latency.ack_interval_ms < ReliableConfig::default().ack_interval_ms);
+        assert!(low_latency.fec_delay < ReliableConfig::default().fec_delay);
 
-        let high_throughput = ReliableConfig::high_throughput();
-        assert!(
-            high_throughput.ack_every_n_packets > ReliableConfig::default().ack_every_n_packets
-        );
+        let high_redundancy = ReliableConfig::high_redundancy();
+        assert!(high_redundancy.fec_parities > ReliableConfig::default().fec_parities);
     }
 
     #[test]
-    fn test_encoder_decoder_creation() {
-        let (tx, rx) = MemoryChannel::pair();
-
-        let config = ReliableConfig::default();
-        let encoder = ReliableEncoder::new(config.clone(), tx);
-        let decoder = ReliableDecoder::new(config, rx);
-
-        assert!(encoder.is_ok());
-        assert!(decoder.is_ok());
-    }
-
-    #[test]
-    fn test_send_receive_basic() {
-        let (tx, rx) = MemoryChannel::pair();
-
-        let config = ReliableConfig::default();
-        let mut encoder = ReliableEncoder::new(config.clone(), tx).unwrap();
-        let mut decoder = ReliableDecoder::new(config.clone(), rx).unwrap();
-
-        // Send a packet
-        let data = vec![0x42u8; config.symbol_bytes];
-        let seq = encoder.send(&data).unwrap();
-        assert_eq!(seq, 0);
-
-        // Receive the packet
-        let result = decoder.recv_no_ack().unwrap();
-        match result {
-            RecvResult::Source {
-                seq,
-                data: recv_data,
-                recovered,
-            } => {
-                assert_eq!(seq, 0);
-                assert_eq!(recv_data, data);
-                assert!(!recovered);
-            }
-            _ => panic!("Expected Source result"),
-        }
-    }
-
-    #[test]
-    fn test_multiple_packets() {
-        let (tx, rx) = MemoryChannel::pair();
-
-        let config = ReliableConfig::default();
-        let mut encoder = ReliableEncoder::new(config.clone(), tx).unwrap();
-        let mut decoder = ReliableDecoder::new(config.clone(), rx).unwrap();
-
-        // Send multiple packets
-        for i in 0..10u8 {
-            let data = vec![i; config.symbol_bytes];
-            let seq = encoder.send(&data).unwrap();
-            assert_eq!(seq, i as u16);
-        }
-
-        // Receive all packets (source + parity)
-        let mut received_sources = 0;
-        while let Ok(result) = decoder.try_recv() {
-            match result {
-                RecvResult::Source { .. } => received_sources += 1,
-                RecvResult::Parity => {}
-                RecvResult::WouldBlock => break,
-                _ => {}
-            }
-        }
-
-        // Should have received at least the source packets
-        assert!(received_sources >= 10);
-    }
-
-    #[test]
-    fn test_ack_generation() {
+    fn test_nack_generation() {
         let mut arq = ReceiverArq::new();
-        let stats = NetworkStats::new();
 
         arq.on_receive(0);
         arq.on_receive(1);
         arq.on_receive(3); // Skip 2
 
-        let ack = arq.build_ack(&stats);
+        assert!(arq.has_gaps());
 
-        // After receiving 0, 1, 3:
-        // - Window advances to base_seq=2 (first gap)
-        // - Bitmap: bit 0 (seq 2) = 0 (missing), bit 1 (seq 3) = 1 (received)
-        assert_eq!(ack.base_seq, 2);
-        assert_eq!(ack.is_received(2), Some(false)); // Gap
-        assert_eq!(ack.is_received(3), Some(true));
+        let nack = arq.build_nack();
+        assert!(nack.sequences.contains(&2));
     }
 
     #[test]
-    fn test_ack_roundtrip() {
-        let (tx, rx) = MemoryChannel::pair();
+    fn test_sender_retransmit() {
+        let mut arq = SenderArq::new(128, 3);
 
-        let config = ReliableConfig::default();
-        let mut encoder = ReliableEncoder::new(config.clone(), tx).unwrap();
-        let mut decoder = ReliableDecoder::new(config.clone(), rx).unwrap();
+        arq.on_send(b"packet0");
+        arq.on_send(b"packet1");
+        arq.on_send(b"packet2");
 
-        // Send enough packets to trigger ACK
-        for i in 0..(config.ack_every_n_packets + 1) as u8 {
-            let data = vec![i; config.symbol_bytes];
-            encoder.send(&data).unwrap();
-        }
+        let nack = NackPacket::new(vec![1]);
+        let to_retransmit = arq.on_nack(&nack);
+        assert_eq!(to_retransmit, vec![1]);
 
-        // Receive packets (should trigger ACK)
-        while let Ok(result) = decoder.try_recv() {
-            if matches!(result, RecvResult::WouldBlock) {
-                break;
-            }
-        }
-
-        // Force an ACK
-        decoder.force_ack().unwrap();
-
-        // Encoder should be able to process the ACK
-        // (In real scenario, we'd need bidirectional transport)
+        let data = arq.get_retransmit(1).unwrap();
+        assert_eq!(data, b"packet1");
     }
 }
 
@@ -158,7 +65,7 @@ mod async_tests {
     use std::pin::Pin;
     use tokio::sync::mpsc;
 
-    /// Async memory channel for testing async encoder/decoder.
+    /// Async memory channel for testing.
     struct AsyncMemoryChannel {
         sender: mpsc::UnboundedSender<Vec<u8>>,
         receiver: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
@@ -215,130 +122,10 @@ mod async_tests {
     }
 
     #[tokio::test]
-    async fn test_async_encoder_creation() {
-        let (tx, _rx) = AsyncMemoryChannel::pair();
-        let config = ReliableConfig::default();
-        let encoder = AsyncReliableEncoder::new(config, tx);
-        assert!(encoder.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_async_decoder_creation() {
-        let (_tx, rx) = AsyncMemoryChannel::pair();
-        let config = ReliableConfig::default();
-        let decoder = AsyncReliableDecoder::new(config, rx);
-        assert!(decoder.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_async_send_receive() {
-        let (tx, rx) = AsyncMemoryChannel::pair();
-
-        let config = ReliableConfig::default();
-        let mut encoder = AsyncReliableEncoder::new(config.clone(), tx).unwrap();
-        let mut decoder = AsyncReliableDecoder::new(config.clone(), rx).unwrap();
-
-        // Send a packet
-        let data = vec![0x42u8; config.symbol_bytes];
-        let seq = encoder.send(&data).await.unwrap();
-        assert_eq!(seq, 0);
-
-        // Receive the packet
-        let result = decoder.recv_no_ack().await.unwrap();
-        match result {
-            RecvResult::Source {
-                seq,
-                data: recv_data,
-                recovered,
-            } => {
-                assert_eq!(seq, 0);
-                assert_eq!(recv_data, data);
-                assert!(!recovered);
-            }
-            _ => panic!("Expected Source result"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_async_multiple_packets() {
-        let (tx, rx) = AsyncMemoryChannel::pair();
-
-        let config = ReliableConfig::default();
-        let mut encoder = AsyncReliableEncoder::new(config.clone(), tx).unwrap();
-        let mut decoder = AsyncReliableDecoder::new(config.clone(), rx).unwrap();
-
-        // Send multiple packets
-        for i in 0..5u8 {
-            let data = vec![i; config.symbol_bytes];
-            let seq = encoder.send(&data).await.unwrap();
-            assert_eq!(seq, i as u16);
-        }
-
-        // Receive packets (source + parity)
-        let mut received_sources = 0;
-        for _ in 0..20 {
-            // Enough iterations to receive all
-            let result = decoder.recv_no_ack().await.unwrap();
-            match result {
-                RecvResult::Source { seq, data, .. } => {
-                    assert_eq!(data[0], seq as u8);
-                    received_sources += 1;
-                    if received_sources >= 5 {
-                        break;
-                    }
-                }
-                RecvResult::Parity => {}
-                _ => {}
-            }
-        }
-
-        assert_eq!(received_sources, 5);
-    }
-
-    #[tokio::test]
-    async fn test_async_flush() {
-        let (tx, _rx) = AsyncMemoryChannel::pair();
-
-        let config = ReliableConfig::default();
-        let mut encoder = AsyncReliableEncoder::new(config.clone(), tx).unwrap();
-
-        // Send a few packets
-        for i in 0..3u8 {
-            let data = vec![i; config.symbol_bytes];
-            encoder.send(&data).await.unwrap();
-        }
-
-        // Flush should succeed
-        let result = encoder.flush().await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_async_encoder_accessors() {
-        let (tx, _rx) = AsyncMemoryChannel::pair();
-        let config = ReliableConfig::default();
-        let encoder = AsyncReliableEncoder::new(config.clone(), tx).unwrap();
-
-        assert_eq!(encoder.config().symbol_bytes, config.symbol_bytes);
-        assert!(!encoder.arq().is_full());
-        assert!(encoder.can_send());
-    }
-
-    #[tokio::test]
-    async fn test_async_decoder_accessors() {
-        let (_tx, rx) = AsyncMemoryChannel::pair();
-        let config = ReliableConfig::default();
-        let decoder = AsyncReliableDecoder::new(config.clone(), rx).unwrap();
-
-        assert_eq!(decoder.config().symbol_bytes, config.symbol_bytes);
-        assert!(!decoder.has_source(0));
-    }
-
-    #[tokio::test]
     async fn test_session_creation() {
         let (tx, _rx) = AsyncMemoryChannel::pair();
         let config = ReliableConfig::default();
-        let session = AsyncReliableSession::new(config, tx);
+        let session = SimpleSession::new(config, tx);
         assert!(session.is_ok());
     }
 
@@ -347,8 +134,8 @@ mod async_tests {
         let (sender_transport, receiver_transport) = AsyncMemoryChannel::pair();
 
         let config = ReliableConfig::default();
-        let mut sender = AsyncReliableSession::new(config.clone(), sender_transport).unwrap();
-        let mut receiver = AsyncReliableSession::new(config.clone(), receiver_transport).unwrap();
+        let mut sender = SimpleSession::new(config.clone(), sender_transport).unwrap();
+        let mut receiver = SimpleSession::new(config.clone(), receiver_transport).unwrap();
 
         // Send a packet
         let data = vec![0x42u8; config.symbol_bytes];
@@ -372,55 +159,61 @@ mod async_tests {
     }
 
     #[tokio::test]
-    async fn test_session_ack_and_retransmit() {
-        // This test verifies that ACKs are processed and retransmission mechanism works
+    async fn test_session_multiple_packets() {
         let (sender_transport, receiver_transport) = AsyncMemoryChannel::pair();
 
+        // Use minimal FEC config
         let mut config = ReliableConfig::default();
-        config.ack_every_n_packets = 2; // Send ACK after 2 packets
-        config.min_ack_interval_ms = 0; // No rate limiting for test
+        config.fec_delay = 16; // Large delay so no parities are sent for 5 packets
+        config.fec_step_size = 16;
 
-        let mut sender = AsyncReliableSession::new(config.clone(), sender_transport).unwrap();
-        let mut receiver = AsyncReliableSession::new(config.clone(), receiver_transport).unwrap();
+        let mut sender = SimpleSession::new(config.clone(), sender_transport).unwrap();
+        let mut receiver = SimpleSession::new(config.clone(), receiver_transport).unwrap();
 
-        // Send 3 packets
+        // Send 5 packets
+        for i in 0..5u8 {
+            let data = vec![i; config.symbol_bytes];
+            let seq = sender.send(&data).await.unwrap();
+            assert_eq!(seq, i as u16);
+        }
+
+        // Receive 5 source packets
+        for i in 0..5u8 {
+            let result = receiver.recv().await.unwrap();
+            match result {
+                RecvResult::Source { seq, data, .. } => {
+                    assert_eq!(seq, i as u16);
+                    assert_eq!(data[0], i);
+                }
+                _ => panic!("Expected Source, got {:?}", result),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_flush() {
+        let (tx, _rx) = AsyncMemoryChannel::pair();
+
+        let config = ReliableConfig::default();
+        let mut sender = SimpleSession::new(config.clone(), tx).unwrap();
+
+        // Send a few packets
         for i in 0..3u8 {
             let data = vec![i; config.symbol_bytes];
             sender.send(&data).await.unwrap();
         }
 
-        // Receive 3 packets on receiver side (should trigger ACK after 2)
-        let mut received = 0;
-        for _ in 0..20 {
-            let result = receiver.recv().await.unwrap();
-            if matches!(result, RecvResult::Source { .. }) {
-                received += 1;
-                if received >= 3 {
-                    break;
-                }
-            }
-        }
-        assert!(received >= 3, "Expected to receive at least 3 packets");
-
-        // Now sender should be able to process ACKs
-        // The ACK was sent by receiver.recv() internally
-        let _retransmits = sender.poll_acks().await.unwrap();
-
-        // The key thing is that the sender's ARQ state was updated
-        // The base_seq should have advanced after processing ACKs
-        // Note: Some retransmits may happen due to how the bitmap works
-        // (the bitmap may show some sequences as "missing" before they arrive)
+        // Flush should succeed
+        assert!(sender.flush().await.is_ok());
     }
 
     #[tokio::test]
     async fn test_session_accessors() {
         let (tx, _rx) = AsyncMemoryChannel::pair();
         let config = ReliableConfig::default();
-        let session = AsyncReliableSession::new(config.clone(), tx).unwrap();
+        let session = SimpleSession::new(config.clone(), tx).unwrap();
 
         assert_eq!(session.config().symbol_bytes, config.symbol_bytes);
-        assert!(!session.sender_arq().is_full());
-        assert!(session.can_send());
-        assert_eq!(session.total_retransmits(), 0);
+        assert_eq!(session.sender_arq().total_retransmits(), 0);
     }
 }

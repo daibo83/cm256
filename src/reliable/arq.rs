@@ -1,440 +1,282 @@
-//! ARQ (Automatic Repeat reQuest) state machines for reliable transport.
+//! Simple NACK-based ARQ for symbol-level retransmission.
 //!
-//! Provides sender and receiver state tracking for sliding window ARQ
-//! with 64-symbol bitmap acknowledgments.
+//! - Sender buffers sent packets for retransmission
+//! - Receiver tracks gaps and generates NACK packets
+//! - No flow control, no congestion control - just retransmit on demand
 
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use super::protocol::AckPacket;
-use super::stats::NetworkStats;
+use super::protocol::NackPacket;
 
-/// A packet stored in the send buffer for potential retransmission.
+/// A packet stored for potential retransmission.
 #[derive(Debug, Clone)]
 pub struct SentPacket {
     /// Sequence number.
     pub seq: u16,
-
-    /// Packet data (source symbol only, not parity).
+    /// Packet data.
     pub data: Vec<u8>,
-
-    /// When the packet was originally sent.
+    /// When originally sent.
     pub send_time: Instant,
-
-    /// Number of times this packet has been retransmitted.
+    /// Number of retransmissions.
     pub retransmit_count: u8,
 }
 
-/// Sender-side ARQ state machine.
-///
-/// Maintains a buffer of sent packets for retransmission and processes
-/// ACK bitmaps to determine which packets need to be retransmitted.
+/// Sender-side ARQ: buffers packets for retransmission.
 #[derive(Debug)]
 pub struct SenderArq {
     /// Ring buffer of sent packets.
-    send_buffer: VecDeque<SentPacket>,
-
+    buffer: VecDeque<SentPacket>,
     /// Maximum buffer size.
-    max_buffer_size: usize,
-
-    /// Base sequence (oldest unacked).
-    base_seq: u16,
-
-    /// Next sequence number to assign.
+    max_size: usize,
+    /// Next sequence number.
     next_seq: u16,
-
-    /// Maximum retransmit attempts per packet.
+    /// Maximum retransmit attempts.
     max_retries: u8,
-
-    /// Total number of retransmissions.
+    /// Total retransmissions.
     total_retransmits: u64,
 }
 
 impl SenderArq {
-    /// Create a new sender ARQ state machine.
+    /// Create a new sender ARQ.
     pub fn new(buffer_size: u16, max_retries: u8) -> Self {
         Self {
-            send_buffer: VecDeque::with_capacity(buffer_size as usize),
-            max_buffer_size: buffer_size as usize,
-            base_seq: 0,
+            buffer: VecDeque::with_capacity(buffer_size as usize),
+            max_size: buffer_size as usize,
             next_seq: 0,
             max_retries,
             total_retransmits: 0,
         }
     }
 
-    /// Get the next sequence number (for sending).
+    /// Get next sequence number.
     pub fn next_seq(&self) -> u16 {
         self.next_seq
     }
 
-    /// Get the base sequence (oldest unacked).
-    pub fn base_seq(&self) -> u16 {
-        self.base_seq
-    }
-
-    /// Get total number of retransmissions.
+    /// Get total retransmissions.
     pub fn total_retransmits(&self) -> u64 {
         self.total_retransmits
     }
 
-    /// Get the number of packets in flight (sent but not acked).
-    pub fn in_flight(&self) -> usize {
-        self.send_buffer.len()
-    }
-
-    /// Check if the send buffer is full.
-    pub fn is_full(&self) -> bool {
-        self.send_buffer.len() >= self.max_buffer_size
-    }
-
-    /// Record a packet being sent.
-    ///
-    /// Returns the assigned sequence number, or None if buffer is full.
-    pub fn on_send(&mut self, data: &[u8]) -> Option<u16> {
-        if self.is_full() {
-            return None;
-        }
-
+    /// Record a packet being sent. Returns the assigned sequence number.
+    pub fn on_send(&mut self, data: &[u8]) -> u16 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
 
-        self.send_buffer.push_back(SentPacket {
+        // Remove oldest if buffer full
+        if self.buffer.len() >= self.max_size {
+            self.buffer.pop_front();
+        }
+
+        self.buffer.push_back(SentPacket {
             seq,
             data: data.to_vec(),
             send_time: Instant::now(),
             retransmit_count: 0,
         });
 
-        Some(seq)
+        seq
     }
 
-    /// Process an ACK packet and return sequences that need retransmission.
-    ///
-    /// Also advances the base_seq and frees acknowledged packets from the buffer.
-    pub fn on_ack(&mut self, ack: &AckPacket) -> Vec<u16> {
-        // Advance base_seq if ACK indicates progress
-        self.advance_base(ack.base_seq);
+    /// Get packet data for retransmission. Returns None if not found or max retries exceeded.
+    pub fn get_retransmit(&mut self, seq: u16) -> Option<Vec<u8>> {
+        let pkt = self.buffer.iter_mut().find(|p| p.seq == seq)?;
 
-        // Find packets that need retransmission
-        let mut retransmits = Vec::new();
-
-        for missing_seq in ack.missing_seqs() {
-            // Check if this seq is in our buffer and eligible for retransmit
-            if let Some(pkt) = self.find_packet_mut(missing_seq) {
-                if pkt.retransmit_count < self.max_retries {
-                    retransmits.push(missing_seq);
-                }
-            }
+        if pkt.retransmit_count >= self.max_retries {
+            return None;
         }
 
-        retransmits
-    }
-
-    /// Get data for retransmission and mark as retransmitted.
-    ///
-    /// Returns None if the packet is not in the buffer or max retries exceeded.
-    pub fn get_retransmit_data(&mut self, seq: u16) -> Option<Vec<u8>> {
-        let max_retries = self.max_retries;
-
-        {
-            let pkt = self.find_packet_mut(seq)?;
-
-            if pkt.retransmit_count >= max_retries {
-                return None;
-            }
-
-            pkt.retransmit_count += 1;
-            pkt.send_time = Instant::now();
-        }
-
+        pkt.retransmit_count += 1;
+        pkt.send_time = Instant::now();
         self.total_retransmits += 1;
 
-        let pkt = self.find_packet_mut(seq)?;
         Some(pkt.data.clone())
     }
 
-    /// Peek at packet data without marking as retransmitted.
-    pub fn peek_packet(&self, seq: u16) -> Option<&[u8]> {
-        self.find_packet(seq).map(|p| p.data.as_slice())
-    }
+    /// Process a NACK and return sequences to retransmit.
+    pub fn on_nack(&mut self, nack: &NackPacket) -> Vec<u16> {
+        let mut to_retransmit = Vec::new();
 
-    /// Advance the base sequence, removing acknowledged packets.
-    fn advance_base(&mut self, new_base: u16) {
-        // Only advance if new_base is ahead of current base
-        // Handle wraparound: new_base is ahead if (new_base - base) < 32768
-        let diff = new_base.wrapping_sub(self.base_seq);
-        if diff == 0 || diff >= 32768 {
-            return; // No advancement or wrapped backwards
+        for &seq in &nack.sequences {
+            if let Some(pkt) = self.buffer.iter().find(|p| p.seq == seq) {
+                if pkt.retransmit_count < self.max_retries {
+                    to_retransmit.push(seq);
+                }
+            }
         }
 
-        // Remove packets from front of buffer until we reach new_base
-        while !self.send_buffer.is_empty() {
-            if let Some(front) = self.send_buffer.front() {
-                let front_diff = new_base.wrapping_sub(front.seq);
-                if front_diff > 0 && front_diff < 32768 {
-                    // front.seq is before new_base, remove it
-                    self.send_buffer.pop_front();
-                } else {
-                    break;
-                }
+        to_retransmit
+    }
+
+    /// Advance base sequence, removing old packets.
+    pub fn advance(&mut self, new_base: u16) {
+        while let Some(front) = self.buffer.front() {
+            let diff = new_base.wrapping_sub(front.seq);
+            if diff > 0 && diff < 32768 {
+                self.buffer.pop_front();
             } else {
                 break;
             }
         }
-
-        self.base_seq = new_base;
     }
 
-    /// Find a packet in the buffer by sequence number.
-    fn find_packet(&self, seq: u16) -> Option<&SentPacket> {
-        self.send_buffer.iter().find(|p| p.seq == seq)
-    }
-
-    /// Find a packet in the buffer by sequence number (mutable).
-    fn find_packet_mut(&mut self, seq: u16) -> Option<&mut SentPacket> {
-        self.send_buffer.iter_mut().find(|p| p.seq == seq)
-    }
-
-    /// Reset the ARQ state.
+    /// Reset state.
     pub fn reset(&mut self) {
-        self.send_buffer.clear();
-        self.base_seq = 0;
+        self.buffer.clear();
         self.next_seq = 0;
         self.total_retransmits = 0;
     }
 }
 
-/// Receiver-side ARQ state machine.
-///
-/// Tracks received packets using a 64-symbol bitmap and generates
-/// ACK packets for the sender.
+/// Receiver-side ARQ: tracks received sequences and generates NACKs.
 #[derive(Debug)]
 pub struct ReceiverArq {
-    /// Base sequence (left edge of window).
-    base_seq: u16,
-
-    /// Bitmap of received symbols (64 bits = 8 bytes).
-    received_bitmap: [u8; 8],
-
-    /// Highest sequence number seen.
+    /// Expected next sequence.
+    next_expected: u16,
+    /// Highest sequence seen.
     max_seen: u16,
-
-    /// Packets received since last ACK.
-    packets_since_ack: u16,
-
-    /// Last ACK send time.
-    last_ack_time: Option<Instant>,
+    /// Received sequence bitmap (simple tracking for NACK generation).
+    /// Tracks sequences from next_expected to max_seen.
+    received: Vec<bool>,
+    /// Maximum gap to track.
+    max_gap: usize,
+    /// Packets received since last NACK.
+    packets_since_nack: u16,
+    /// Last NACK time.
+    last_nack_time: Option<Instant>,
+    /// Whether first packet received.
+    initialized: bool,
 }
 
 impl ReceiverArq {
-    /// Create a new receiver ARQ state machine.
+    /// Create a new receiver ARQ.
     pub fn new() -> Self {
         Self {
-            base_seq: 0,
-            received_bitmap: [0u8; 8],
+            next_expected: 0,
             max_seen: 0,
-            packets_since_ack: 0,
-            last_ack_time: None,
+            received: Vec::new(),
+            max_gap: 256, // Track up to 256 sequences
+            packets_since_nack: 0,
+            last_nack_time: None,
+            initialized: false,
         }
     }
 
-    /// Get the base sequence.
-    pub fn base_seq(&self) -> u16 {
-        self.base_seq
+    /// Get next expected sequence.
+    pub fn next_expected(&self) -> u16 {
+        self.next_expected
     }
 
-    /// Get the maximum seen sequence.
+    /// Get max seen sequence.
     pub fn max_seen(&self) -> u16 {
         self.max_seen
     }
 
-    /// Get packets received since last ACK.
-    pub fn packets_since_ack(&self) -> u16 {
-        self.packets_since_ack
-    }
-
-    /// Record receipt of a packet.
-    ///
-    /// Returns true if this is a new packet (not a duplicate).
+    /// Record receipt of a packet. Returns true if new (not duplicate).
     pub fn on_receive(&mut self, seq: u16) -> bool {
-        // Update max_seen
+        if !self.initialized {
+            // First packet - initialize and advance past it
+            self.next_expected = seq.wrapping_add(1);
+            self.max_seen = seq;
+            self.initialized = true;
+            self.packets_since_nack += 1;
+            return true;
+        }
+
+        // Check if duplicate or old (seq < next_expected)
+        let diff = seq.wrapping_sub(self.next_expected);
+        if diff >= 32768 {
+            // seq is before next_expected (old/duplicate)
+            return false;
+        }
+
+        // seq >= next_expected
+        let offset = diff as usize;
+
+        // Update max_seen if needed
         let max_diff = seq.wrapping_sub(self.max_seen);
         if max_diff > 0 && max_diff < 32768 {
             self.max_seen = seq;
         }
 
-        // Check if seq is within our window
-        let offset = seq.wrapping_sub(self.base_seq);
-
-        if offset >= 64 {
-            if offset < 32768 {
-                // Seq is ahead of our window, need to advance
-                self.advance_window(seq);
-                // Recalculate offset after advancing
-                let new_offset = seq.wrapping_sub(self.base_seq);
-                if new_offset < 64 {
-                    self.set_bit(new_offset as usize);
-                    self.packets_since_ack += 1;
-                    return true;
-                }
+        // Ensure received vector is large enough
+        if offset >= self.received.len() {
+            if offset < self.max_gap {
+                self.received.resize(offset + 1, false);
+            } else {
+                // Too far ahead, truncate tracking
+                return true;
             }
-            // Seq is behind our window (old duplicate)
-            return false;
         }
 
-        // Check if already received (duplicate)
-        let byte_idx = (offset / 8) as usize;
-        let bit_idx = offset % 8;
-        let already_received = (self.received_bitmap[byte_idx] >> bit_idx) & 1 == 1;
-
-        if already_received {
+        // Check for duplicate
+        if self.received[offset] {
             return false;
         }
 
         // Mark as received
-        self.set_bit(offset as usize);
-        self.packets_since_ack += 1;
+        self.received[offset] = true;
+        self.packets_since_nack += 1;
 
-        // Try to advance window if we have contiguous receipts from base
-        self.try_advance_window();
+        // Advance next_expected if we have contiguous packets from start
+        while !self.received.is_empty() && self.received[0] {
+            self.received.remove(0);
+            self.next_expected = self.next_expected.wrapping_add(1);
+        }
 
         true
     }
 
-    /// Build an ACK packet with current state.
-    pub fn build_ack(&mut self, stats: &NetworkStats) -> AckPacket {
-        self.packets_since_ack = 0;
-        self.last_ack_time = Some(Instant::now());
+    /// Build a NACK packet for missing sequences.
+    pub fn build_nack(&mut self) -> NackPacket {
+        let mut missing = Vec::new();
 
-        AckPacket::with_stats(
-            self.base_seq,
-            self.max_seen,
-            self.received_bitmap,
-            stats.loss_rate(),
-            stats.avg_rtt_ms(),
-        )
+        for (i, &recv) in self.received.iter().enumerate() {
+            if !recv {
+                let seq = self.next_expected.wrapping_add(i as u16);
+                missing.push(seq);
+                if missing.len() >= NackPacket::MAX_SEQUENCES {
+                    break;
+                }
+            }
+        }
+
+        self.packets_since_nack = 0;
+        self.last_nack_time = Some(Instant::now());
+
+        NackPacket::new(missing)
     }
 
-    /// Build an ACK packet without stats.
-    pub fn build_ack_simple(&mut self) -> AckPacket {
-        self.packets_since_ack = 0;
-        self.last_ack_time = Some(Instant::now());
-
-        AckPacket::new(self.base_seq, self.max_seen, self.received_bitmap)
+    /// Check if we should send a NACK (have gaps).
+    pub fn has_gaps(&self) -> bool {
+        self.received.iter().any(|&r| !r)
     }
 
-    /// Check if we should send an ACK based on packet count.
-    pub fn should_ack_by_count(&self, threshold: u16) -> bool {
-        self.packets_since_ack >= threshold
+    /// Check if should NACK by packet count.
+    pub fn should_nack_by_count(&self, threshold: u16) -> bool {
+        self.has_gaps() && self.packets_since_nack >= threshold
     }
 
-    /// Check if we should send an ACK based on time.
-    pub fn should_ack_by_time(&self, interval_ms: u64) -> bool {
-        match self.last_ack_time {
+    /// Check if should NACK by time.
+    pub fn should_nack_by_time(&self, interval_ms: u64) -> bool {
+        if !self.has_gaps() {
+            return false;
+        }
+        match self.last_nack_time {
             None => true,
             Some(t) => t.elapsed().as_millis() >= interval_ms as u128,
         }
     }
 
-    /// Check if enough time has passed since last ACK (for rate limiting).
-    pub fn can_send_ack(&self, min_interval_ms: u64) -> bool {
-        match self.last_ack_time {
-            None => true,
-            Some(t) => t.elapsed().as_millis() >= min_interval_ms as u128,
-        }
-    }
-
-    /// Set a bit in the bitmap.
-    fn set_bit(&mut self, offset: usize) {
-        if offset < 64 {
-            let byte_idx = offset / 8;
-            let bit_idx = offset % 8;
-            self.received_bitmap[byte_idx] |= 1 << bit_idx;
-        }
-    }
-
-    /// Clear a bit in the bitmap.
-    #[allow(dead_code)]
-    fn clear_bit(&mut self, offset: usize) {
-        if offset < 64 {
-            let byte_idx = offset / 8;
-            let bit_idx = offset % 8;
-            self.received_bitmap[byte_idx] &= !(1 << bit_idx);
-        }
-    }
-
-    /// Try to advance the window if we have contiguous receipts from base.
-    fn try_advance_window(&mut self) {
-        // Count contiguous received packets from the start
-        let mut advance_by = 0u16;
-
-        for i in 0..64 {
-            let byte_idx = i / 8;
-            let bit_idx = i % 8;
-            if (self.received_bitmap[byte_idx] >> bit_idx) & 1 == 1 {
-                advance_by += 1;
-            } else {
-                break;
-            }
-        }
-
-        if advance_by > 0 {
-            self.shift_window(advance_by);
-        }
-    }
-
-    /// Advance window to include a specific sequence.
-    fn advance_window(&mut self, target_seq: u16) {
-        let needed_advance = target_seq.wrapping_sub(self.base_seq).saturating_sub(63);
-        if needed_advance > 0 && needed_advance < 32768 {
-            self.shift_window(needed_advance);
-        }
-    }
-
-    /// Shift the window forward by n positions.
-    fn shift_window(&mut self, n: u16) {
-        if n == 0 {
-            return;
-        }
-
-        if n >= 64 {
-            // Complete reset
-            self.base_seq = self.base_seq.wrapping_add(n);
-            self.received_bitmap = [0u8; 8];
-            return;
-        }
-
-        let n = n as usize;
-
-        // Shift bitmap left by n bits
-        // This is a bit fiddly because we're shifting across byte boundaries
-        let mut new_bitmap = [0u8; 8];
-
-        for i in 0..64 {
-            let src_pos = i + n;
-            if src_pos < 64 {
-                let src_byte = src_pos / 8;
-                let src_bit = src_pos % 8;
-                let bit = (self.received_bitmap[src_byte] >> src_bit) & 1;
-
-                let dst_byte = i / 8;
-                let dst_bit = i % 8;
-                new_bitmap[dst_byte] |= bit << dst_bit;
-            }
-        }
-
-        self.received_bitmap = new_bitmap;
-        self.base_seq = self.base_seq.wrapping_add(n as u16);
-    }
-
-    /// Reset the receiver state.
+    /// Reset state.
     pub fn reset(&mut self) {
-        self.base_seq = 0;
-        self.received_bitmap = [0u8; 8];
+        self.next_expected = 0;
         self.max_seen = 0;
-        self.packets_since_ack = 0;
-        self.last_ack_time = None;
+        self.received.clear();
+        self.packets_since_nack = 0;
+        self.last_nack_time = None;
+        self.initialized = false;
     }
 }
 
@@ -450,132 +292,61 @@ mod tests {
 
     #[test]
     fn test_sender_basic() {
-        let mut sender = SenderArq::new(128, 2);
+        let mut sender = SenderArq::new(128, 3);
 
-        assert_eq!(sender.next_seq(), 0);
-        assert_eq!(sender.in_flight(), 0);
-
-        // Send some packets
-        let seq0 = sender.on_send(b"packet0").unwrap();
-        let seq1 = sender.on_send(b"packet1").unwrap();
-        let seq2 = sender.on_send(b"packet2").unwrap();
+        let seq0 = sender.on_send(b"packet0");
+        let seq1 = sender.on_send(b"packet1");
+        let seq2 = sender.on_send(b"packet2");
 
         assert_eq!(seq0, 0);
         assert_eq!(seq1, 1);
         assert_eq!(seq2, 2);
-        assert_eq!(sender.in_flight(), 3);
-    }
-
-    #[test]
-    fn test_sender_ack_processing() {
-        let mut sender = SenderArq::new(128, 2);
-
-        // Send packets 0-3
-        for i in 0..4 {
-            sender.on_send(&[i as u8; 100]);
-        }
-
-        // ACK with base=2, meaning 0,1 are fully acked
-        // Bitmap shows 2,3 received
-        let bitmap = [0b00000011, 0, 0, 0, 0, 0, 0, 0];
-        let ack = AckPacket::new(2, 3, bitmap);
-
-        let retransmits = sender.on_ack(&ack);
-
-        // Packets 0,1 should be removed, no retransmits needed
-        assert!(retransmits.is_empty());
-        assert_eq!(sender.base_seq(), 2);
-        assert_eq!(sender.in_flight(), 2); // packets 2,3 still in buffer
+        assert_eq!(sender.next_seq(), 3);
     }
 
     #[test]
     fn test_sender_retransmit() {
-        let mut sender = SenderArq::new(128, 2);
+        let mut sender = SenderArq::new(128, 3);
 
-        // Send packets 0-3
-        for i in 0..4 {
-            sender.on_send(&[i as u8; 100]);
-        }
+        sender.on_send(b"packet0");
+        sender.on_send(b"packet1");
+        sender.on_send(b"packet2");
 
-        // ACK with bitmap showing packet 1 missing
-        // base=0, bitmap: 0=recv, 1=missing, 2=recv, 3=recv
-        let bitmap = [0b00001101, 0, 0, 0, 0, 0, 0, 0];
-        let ack = AckPacket::new(0, 3, bitmap);
-
-        let retransmits = sender.on_ack(&ack);
-
+        let nack = NackPacket::new(vec![1]);
+        let retransmits = sender.on_nack(&nack);
         assert_eq!(retransmits, vec![1]);
 
-        // Get data for retransmit
-        let data = sender.get_retransmit_data(1).unwrap();
-        assert_eq!(data, &[1u8; 100]);
+        let data = sender.get_retransmit(1).unwrap();
+        assert_eq!(data, b"packet1");
     }
 
     #[test]
-    fn test_receiver_basic() {
+    fn test_sender_max_retries() {
+        let mut sender = SenderArq::new(128, 2);
+        sender.on_send(b"packet0");
+
+        // First two retransmits succeed
+        assert!(sender.get_retransmit(0).is_some());
+        assert!(sender.get_retransmit(0).is_some());
+
+        // Third fails (max_retries = 2)
+        assert!(sender.get_retransmit(0).is_none());
+    }
+
+    #[test]
+    fn test_receiver_in_order() {
         let mut receiver = ReceiverArq::new();
 
         assert!(receiver.on_receive(0));
         assert!(receiver.on_receive(1));
         assert!(receiver.on_receive(2));
 
-        // Duplicate should return false
-        assert!(!receiver.on_receive(1));
-
-        assert_eq!(receiver.max_seen(), 2);
-        assert_eq!(receiver.packets_since_ack(), 3);
-    }
-
-    #[test]
-    fn test_receiver_out_of_order() {
-        let mut receiver = ReceiverArq::new();
-
-        // Receive out of order: 0, 2, 1, 3
-        assert!(receiver.on_receive(0));
-        assert!(receiver.on_receive(2));
-        assert!(receiver.on_receive(1));
-        assert!(receiver.on_receive(3));
-
-        // Window should have advanced past contiguous packets
-        assert!(receiver.base_seq() >= 4);
+        assert_eq!(receiver.next_expected(), 3);
+        assert!(!receiver.has_gaps());
     }
 
     #[test]
     fn test_receiver_gap() {
-        let mut receiver = ReceiverArq::new();
-
-        // Receive 0, 1, skip 2, receive 3
-        receiver.on_receive(0);
-        receiver.on_receive(1);
-        receiver.on_receive(3);
-
-        // Base should be 2 (stopped at gap)
-        assert_eq!(receiver.base_seq(), 2);
-
-        // Build ACK and check bitmap
-        let stats = NetworkStats::new();
-        let ack = receiver.build_ack(&stats);
-
-        // Bit 0 (seq 2) should be 0 (missing)
-        // Bit 1 (seq 3) should be 1 (received)
-        assert_eq!(ack.is_received(2), Some(false));
-        assert_eq!(ack.is_received(3), Some(true));
-    }
-
-    #[test]
-    fn test_receiver_window_advance() {
-        let mut receiver = ReceiverArq::new();
-
-        // Receive packet far ahead, forcing window advance
-        receiver.on_receive(100);
-
-        // Window should have advanced to include 100
-        assert!(receiver.base_seq() <= 100);
-        assert!(100 - receiver.base_seq() < 64);
-    }
-
-    #[test]
-    fn test_receiver_build_ack() {
         let mut receiver = ReceiverArq::new();
 
         receiver.on_receive(0);
@@ -584,38 +355,51 @@ mod tests {
         receiver.on_receive(3);
         receiver.on_receive(4);
 
-        let stats = NetworkStats::new();
-        let ack = receiver.build_ack(&stats);
+        assert_eq!(receiver.next_expected(), 2);
+        assert!(receiver.has_gaps());
 
-        // Check the missing sequence
-        let missing: Vec<u16> = ack.missing_seqs().collect();
-        assert!(missing.contains(&2));
-
-        // packets_since_ack should reset
-        assert_eq!(receiver.packets_since_ack(), 0);
+        let nack = receiver.build_nack();
+        assert_eq!(nack.sequences, vec![2]);
     }
 
     #[test]
-    fn test_sequence_wraparound() {
-        let mut sender = SenderArq::new(128, 2);
+    fn test_receiver_fill_gap() {
+        let mut receiver = ReceiverArq::new();
 
-        // Start near wraparound
-        sender.base_seq = 65530;
-        sender.next_seq = 65530;
+        receiver.on_receive(0);
+        receiver.on_receive(2);
+        receiver.on_receive(3);
 
-        // Send packets across wraparound
-        for _ in 0..10 {
-            sender.on_send(b"data");
-        }
+        assert_eq!(receiver.next_expected(), 1);
 
-        assert_eq!(sender.in_flight(), 10);
+        // Fill the gap
+        receiver.on_receive(1);
 
-        // ACK that advances past wraparound
-        let bitmap = [0xFF; 8];
-        let ack = AckPacket::new(4, 5, bitmap); // base=4 (wrapped)
+        assert_eq!(receiver.next_expected(), 4);
+        assert!(!receiver.has_gaps());
+    }
 
-        sender.on_ack(&ack);
+    #[test]
+    fn test_receiver_duplicate() {
+        let mut receiver = ReceiverArq::new();
 
-        assert_eq!(sender.base_seq(), 4);
+        assert!(receiver.on_receive(0));
+        assert!(!receiver.on_receive(0)); // Duplicate
+    }
+
+    #[test]
+    fn test_receiver_multiple_gaps() {
+        let mut receiver = ReceiverArq::new();
+
+        receiver.on_receive(0);
+        // Skip 1, 2
+        receiver.on_receive(3);
+        // Skip 4
+        receiver.on_receive(5);
+
+        let nack = receiver.build_nack();
+        assert!(nack.sequences.contains(&1));
+        assert!(nack.sequences.contains(&2));
+        assert!(nack.sequences.contains(&4));
     }
 }
