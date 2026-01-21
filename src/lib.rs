@@ -51,7 +51,6 @@
 //! // result.parities contains generated parity symbols
 //! ```
 
-pub mod reliable;
 pub mod streaming;
 pub mod transport;
 
