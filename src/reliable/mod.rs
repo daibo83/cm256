@@ -59,6 +59,7 @@ mod bbr;
 mod decoder;
 mod encoder;
 mod protocol;
+mod session;
 mod stats;
 
 // Re-exports
@@ -70,6 +71,7 @@ pub use bbr::{BbrMode, BbrState};
 pub use decoder::{RecvResult, ReliableDecoder};
 pub use encoder::ReliableEncoder;
 pub use protocol::{AckPacket, PacketType};
+pub use session::{AsyncReliableSession, SessionRole};
 pub use stats::NetworkStats;
 
 /// Configuration for reliable transport.
@@ -133,8 +135,8 @@ impl Default for ReliableConfig {
             symbol_bytes: 1200,
 
             // ARQ
-            send_buffer_size: 128,
-            max_retries: 2,
+            send_buffer_size: 256,
+            max_retries: 5,
 
             // BBR
             initial_cwnd: 10,

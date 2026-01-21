@@ -23,8 +23,8 @@
 //!
 //! ## With simulated packet loss (for testing):
 //! ```bash
-//! # Receiver with 10% simulated loss
-//! cargo run --release --example reliable_ffmpeg -- recv --loss 10 | ffplay -f h264 -
+//! # Sender with 10% simulated loss
+//! cargo run --release --example reliable_ffmpeg -- send --loss 10
 //! ```
 //!
 //! # Key Features
@@ -36,14 +36,14 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use cm256::reliable::{AsyncReliableDecoder, AsyncReliableEncoder, RecvResult, ReliableConfig};
+use cm256::reliable::{AsyncReliableSession, RecvResult, ReliableConfig};
 use cm256::transport::{AsyncDatagramRecvMut, AsyncDatagramSendMut};
+use rand::Rng;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn, Level};
@@ -55,31 +55,24 @@ use tracing::{debug, info, warn, Level};
 /// UDP socket wrapper with optional packet loss simulation
 struct UdpTransport {
     socket: UdpSocket,
-    /// Simulated loss percentage (0-100)
-    loss_percent: u8,
-    /// Packet counter for deterministic loss
-    send_counter: AtomicU64,
-    recv_counter: AtomicU64,
+    /// Simulated loss percentage (0.0-100.0)
+    loss_percent: f64,
 }
 
 impl UdpTransport {
-    fn new(socket: UdpSocket, loss_percent: u8) -> Self {
+    fn new(socket: UdpSocket, loss_percent: f64) -> Self {
         Self {
             socket,
             loss_percent,
-            send_counter: AtomicU64::new(0),
-            recv_counter: AtomicU64::new(0),
         }
     }
 
-    fn should_drop(&self, counter: u64) -> bool {
-        if self.loss_percent == 0 {
+    fn should_drop(&self) -> bool {
+        if self.loss_percent <= 0.0 {
             return false;
         }
-        // Use deterministic hash for reproducible loss pattern
-        let hash = counter.wrapping_mul(0x9E3779B97F4A7C15);
-        let roll = ((hash >> 56) as u8) % 100;
-        roll < self.loss_percent
+        let mut rng = rand::thread_rng();
+        rng.gen_range(0.0..100.0) < self.loss_percent
     }
 }
 
@@ -89,8 +82,7 @@ impl AsyncDatagramSendMut for UdpTransport {
         data: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
         Box::pin(async move {
-            let count = self.send_counter.fetch_add(1, Ordering::Relaxed);
-            if self.should_drop(count) {
+            if self.should_drop() {
                 // Simulate loss: pretend we sent it
                 return Ok(data.len());
             }
@@ -107,8 +99,7 @@ impl AsyncDatagramRecvMut for UdpTransport {
         Box::pin(async move {
             loop {
                 let n = self.socket.recv(buf).await?;
-                let count = self.recv_counter.fetch_add(1, Ordering::Relaxed);
-                if !self.should_drop(count) {
+                if !self.should_drop() {
                     return Ok(n);
                 }
                 // Dropped - receive next packet
@@ -144,9 +135,9 @@ enum Command {
         #[arg(short, long, default_value = "127.0.0.1:9001")]
         remote: SocketAddr,
 
-        /// Simulated packet loss percentage (0-100)
-        #[arg(long, default_value = "0")]
-        loss: u8,
+        /// Simulated packet loss percentage (0.0-100.0)
+        #[arg(long, default_value = "0.0")]
+        loss: f64,
 
         /// Config preset: default, low-latency, high-throughput, high-rtt
         #[arg(long, default_value = "default")]
@@ -174,9 +165,9 @@ enum Command {
         #[arg(short, long, default_value = "0.0.0.0:9001")]
         listen: SocketAddr,
 
-        /// Simulated packet loss percentage (0-100)
-        #[arg(long, default_value = "0")]
-        loss: u8,
+        /// Simulated packet loss percentage (0.0-100.0)
+        #[arg(long, default_value = "0.0")]
+        loss: f64,
 
         /// Config preset: default, low-latency, high-throughput, high-rtt
         #[arg(long, default_value = "default")]
@@ -239,7 +230,7 @@ fn get_config(
 async fn run_sender(
     listen: SocketAddr,
     remote: SocketAddr,
-    loss_percent: u8,
+    loss_percent: f64,
     preset: String,
     packet_size: usize,
     fec_delay: Option<u8>,
@@ -282,9 +273,9 @@ async fn run_sender(
     // Wrap with loss simulation
     let transport = UdpTransport::new(socket, loss_percent);
 
-    // Create reliable encoder
-    let mut encoder = AsyncReliableEncoder::new(config.clone(), transport)
-        .context("Failed to create reliable encoder")?;
+    // Create reliable session
+    let mut session = AsyncReliableSession::new(config.clone(), transport)
+        .context("Failed to create reliable session")?;
 
     // Channel for stdin data
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
@@ -324,48 +315,256 @@ async fn run_sender(
     let mut last_retransmits = 0u64;
     let start_time = std::time::Instant::now();
 
-    while let Some(data) = rx.recv().await {
-        let actual_len = data.len();
+    // Flow control parameters
+    const MAX_IN_FLIGHT: usize = 64; // Soft limit - start waiting for ACKs
+    const CRITICAL_IN_FLIGHT: usize = 200; // Hard limit - must wait, no timeout
+    const ACK_POLL_INTERVAL: u64 = 8; // Poll for ACKs every N packets
+    const FLOW_CONTROL_TIMEOUT_MS: u64 = 500; // Max time to wait for ACKs (soft limit only)
 
-        // Pad to packet_size
-        let mut padded = data;
-        if padded.len() < packet_size {
-            padded.resize(packet_size, 0);
-        }
+    // Use select! to handle both sending data and receiving ACKs concurrently
+    let mut stdin_closed = false;
+    let mut flow_control_start: Option<std::time::Instant> = None;
+    let mut consecutive_fc_timeouts = 0u32;
 
-        // Send with FEC protection
-        let seq = encoder.send(&padded).await?;
-        source_count += 1;
-        total_bytes += actual_len as u64;
+    loop {
+        // Flow control: if too many packets in flight, prioritize ACK processing
+        let in_flight = session.sender_arq().in_flight();
+        let arq_full = session.sender_arq().is_full();
 
-        debug!("Sent seq={}, len={}", seq, actual_len);
-
-        // Pace sending slightly
-        if source_count % 4 == 0 {
-            tokio::time::sleep(tokio::time::Duration::from_micros(50)).await;
-        }
-
-        // Print stats periodically
-        if source_count % 1000 == 0 {
-            let stats = encoder.stats();
-            let retransmits = encoder.arq().total_retransmits();
-            let new_retransmits = retransmits - last_retransmits;
-            last_retransmits = retransmits;
-
-            info!(
-                "TX: {} pkts, {:.1} MB | Loss: {:.1}% | RTT: {:.0}ms | Retransmits: {} (+{})",
-                source_count,
-                total_bytes as f64 / 1_000_000.0,
-                stats.loss_rate() * 100.0,
-                stats.avg_rtt_ms(),
-                retransmits,
-                new_retransmits,
+        // Critical condition: ARQ buffer nearly full - must wait for ACKs
+        if arq_full || in_flight >= CRITICAL_IN_FLIGHT {
+            debug!(
+                "Critical flow control: {} in flight, ARQ full={}, waiting for ACKs",
+                in_flight, arq_full
             );
+            // Must wait for ACKs - no timeout bypass
+            match tokio::time::timeout(tokio::time::Duration::from_millis(100), session.poll_acks())
+                .await
+            {
+                Ok(Ok(retransmits)) => {
+                    if retransmits > 0 {
+                        debug!("Critical FC: triggered {} retransmits", retransmits);
+                    }
+                }
+                Ok(Err(e)) => debug!("Critical FC ACK error: {}", e),
+                Err(_) => {
+                    // Timeout - yield and retry
+                    tokio::task::yield_now().await;
+                }
+            }
+            continue;
+        }
+
+        // Soft flow control: try to wait for ACKs but allow timeout
+        if in_flight >= MAX_IN_FLIGHT {
+            let fc_start = flow_control_start.get_or_insert_with(std::time::Instant::now);
+
+            if fc_start.elapsed().as_millis() > FLOW_CONTROL_TIMEOUT_MS as u128 {
+                // Timeout - but only allow if we're not critically full
+                consecutive_fc_timeouts += 1;
+                if consecutive_fc_timeouts <= 3 {
+                    warn!(
+                        "Flow control timeout #{}: {} packets in flight, continuing",
+                        consecutive_fc_timeouts, in_flight
+                    );
+                    flow_control_start = None;
+                } else {
+                    // Too many consecutive timeouts - something is wrong
+                    // Wait longer before continuing
+                    warn!(
+                        "Multiple flow control timeouts ({}), waiting longer...",
+                        consecutive_fc_timeouts
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    // Try to drain ACKs
+                    for _ in 0..5 {
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_millis(50),
+                            session.poll_acks(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            _ => break,
+                        }
+                    }
+                    flow_control_start = None;
+                }
+            } else {
+                // Wait for ACKs
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_millis(20),
+                    session.poll_acks(),
+                )
+                .await
+                {
+                    Ok(Ok(retransmits)) => {
+                        if retransmits > 0 {
+                            debug!("Flow control: triggered {} retransmits", retransmits);
+                        }
+                        // Progress made
+                        if session.sender_arq().in_flight() < in_flight {
+                            flow_control_start = None;
+                            consecutive_fc_timeouts = 0;
+                        }
+                    }
+                    Ok(Err(e)) => debug!("ACK error during flow control: {}", e),
+                    Err(_) => {}
+                }
+                continue;
+            }
+        } else {
+            flow_control_start = None;
+            if in_flight < MAX_IN_FLIGHT / 2 {
+                consecutive_fc_timeouts = 0; // Reset when buffer is healthy
+            }
+        }
+
+        if stdin_closed {
+            break;
+        }
+
+        tokio::select! {
+            biased; // Prefer ACK processing over sending when both ready
+
+            // Handle incoming ACKs from receiver (with short timeout)
+            ack_result = tokio::time::timeout(
+                tokio::time::Duration::from_millis(5),
+                session.poll_acks()
+            ) => {
+                match ack_result {
+                    Ok(Ok(retransmits)) => {
+                        if retransmits > 0 {
+                            debug!("Processed ACK, triggered {} retransmits", retransmits);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        debug!("ACK receiver error: {}", e);
+                    }
+                    Err(_) => {
+                        // Timeout - no ACK received, continue to send
+                    }
+                }
+            }
+
+            // Handle incoming data from stdin
+            data_opt = rx.recv() => {
+                match data_opt {
+                    Some(data) => {
+                        let actual_len = data.len();
+
+                        // Pad to packet_size
+                        let mut padded = data;
+                        if padded.len() < packet_size {
+                            padded.resize(packet_size, 0);
+                        }
+
+                        // Send with FEC protection
+                        let seq = session.send(&padded).await?;
+                        source_count += 1;
+                        total_bytes += actual_len as u64;
+                        debug!("Sent seq={}, len={}, in_flight={}", seq, actual_len, session.sender_arq().in_flight());
+
+                        // Poll for ACKs periodically during sending
+                        if source_count % ACK_POLL_INTERVAL == 0 {
+                            // Non-blocking ACK check
+                            if let Ok(Ok(retransmits)) = tokio::time::timeout(
+                                tokio::time::Duration::from_millis(1),
+                                session.poll_acks(),
+                            ).await {
+                                if retransmits > 0 {
+                                    debug!("Periodic ACK: {} retransmits", retransmits);
+                                }
+                            }
+                        }
+
+                        // Print stats periodically
+                        if source_count % 1000 == 0 {
+                            let stats = session.stats();
+                            let retransmits = session.total_retransmits();
+                            let new_retransmits = retransmits - last_retransmits;
+                            last_retransmits = retransmits;
+
+                            info!(
+                                "TX: {} pkts, {:.1} MB | Loss: {:.1}% | RTT: {:.0}ms | In-flight: {} | Retransmits: {} (+{})",
+                                source_count,
+                                total_bytes as f64 / 1_000_000.0,
+                                stats.loss_rate() * 100.0,
+                                stats.avg_rtt_ms(),
+                                session.sender_arq().in_flight(),
+                                retransmits,
+                                new_retransmits,
+                            );
+                        }
+                    }
+                    None => {
+                        // stdin closed, but continue to drain ACKs
+                        stdin_closed = true;
+                    }
+                }
+            }
         }
     }
 
     // Flush remaining parities
-    encoder.flush().await?;
+    session.flush().await?;
+
+    // Drain period: wait for ACKs and complete retransmissions
+    let in_flight = session.sender_arq().in_flight();
+    info!(
+        "Waiting for pending ACKs and retransmissions ({} packets in flight)...",
+        in_flight
+    );
+    let drain_start = std::time::Instant::now();
+    let drain_timeout = std::time::Duration::from_secs(10); // Longer drain period
+    let mut last_progress = std::time::Instant::now();
+    let no_progress_timeout = std::time::Duration::from_secs(3); // Wait longer for ACKs
+
+    while drain_start.elapsed() < drain_timeout {
+        let current_in_flight = session.sender_arq().in_flight();
+
+        if current_in_flight == 0 {
+            info!("All packets acknowledged!");
+            break;
+        }
+
+        match tokio::time::timeout(tokio::time::Duration::from_millis(100), session.poll_acks())
+            .await
+        {
+            Ok(Ok(retransmits)) => {
+                if retransmits > 0 {
+                    debug!("Drain: triggered {} retransmits", retransmits);
+                    last_progress = std::time::Instant::now();
+                }
+                // Check for progress
+                if session.sender_arq().in_flight() < current_in_flight {
+                    last_progress = std::time::Instant::now();
+                }
+            }
+            Ok(Err(e)) => {
+                debug!("Drain ACK error: {}", e);
+            }
+            Err(_) => {
+                // Timeout - check if we're making progress
+                if last_progress.elapsed() > no_progress_timeout {
+                    warn!(
+                        "No progress for {:?}, {} packets still in flight",
+                        no_progress_timeout, current_in_flight
+                    );
+                    // Give up on remaining packets
+                    break;
+                }
+            }
+        }
+    }
+
+    let final_in_flight = session.sender_arq().in_flight();
+    if final_in_flight > 0 {
+        warn!(
+            "Drain timeout: {} packets still unacknowledged",
+            final_in_flight
+        );
+    }
 
     let elapsed = start_time.elapsed().as_secs_f64();
     info!(
@@ -385,7 +584,7 @@ async fn run_sender(
 
 async fn run_receiver(
     listen: SocketAddr,
-    loss_percent: u8,
+    loss_percent: f64,
     preset: String,
     packet_size: usize,
     fec_delay: Option<u8>,
@@ -423,9 +622,9 @@ async fn run_receiver(
     // Wrap with loss simulation
     let transport = UdpTransport::new(socket, loss_percent);
 
-    // Create reliable decoder
-    let mut decoder = AsyncReliableDecoder::new(config.clone(), transport)
-        .context("Failed to create reliable decoder")?;
+    // Create reliable session
+    let mut session = AsyncReliableSession::new(config.clone(), transport)
+        .context("Failed to create reliable session")?;
 
     // Channels for output ordering
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<(u16, Vec<u8>)>(1000);
@@ -461,10 +660,14 @@ async fn run_receiver(
     });
 
     // Ordering task - ensures packets are output in sequence order
+    // Waits for retransmissions before giving up on missing packets
     tokio::task::spawn(async move {
         let mut output_queue: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
         let mut next_seq: u16 = 0;
         let mut first_packet = true;
+        let mut last_output_time = std::time::Instant::now();
+        let gap_timeout = std::time::Duration::from_millis(100); // Wait up to 100ms for missing packets
+        let max_queue_size = 50; // Skip gaps if queue exceeds this
 
         while let Some((seq, data)) = output_rx.recv().await {
             if first_packet {
@@ -480,25 +683,63 @@ async fn run_receiver(
                     return;
                 }
                 next_seq = next_seq.wrapping_add(1);
+                last_output_time = std::time::Instant::now();
             }
 
-            // Handle queue overflow (skip gaps if too many buffered)
-            if output_queue.len() > 200 {
-                if let Some(&first_seq) = output_queue.keys().next() {
-                    let gap = first_seq.wrapping_sub(next_seq);
-                    if gap < 32768 {
-                        eprintln!(
-                            "WARN: Queue overflow, skipping {} -> {}",
-                            next_seq, first_seq
-                        );
-                        next_seq = first_seq;
-                        while let Some(data) = output_queue.remove(&next_seq) {
-                            if write_tx.send(data).is_err() {
-                                return;
+            // Handle gaps - skip if waiting too long or queue too large
+            if !output_queue.is_empty() {
+                let should_skip = output_queue.len() > max_queue_size
+                    || (output_queue.len() > 5 && last_output_time.elapsed() > gap_timeout);
+
+                if should_skip {
+                    if let Some(&first_seq) = output_queue.keys().next() {
+                        let gap = first_seq.wrapping_sub(next_seq);
+                        if gap < 32768 && gap > 0 {
+                            // Only log occasionally to avoid spam
+                            if gap > 5 || output_queue.len() > max_queue_size {
+                                eprintln!(
+                                    "WARN: Skipping gap {} -> {} ({} packets, queue={})",
+                                    next_seq,
+                                    first_seq,
+                                    gap,
+                                    output_queue.len()
+                                );
                             }
-                            next_seq = next_seq.wrapping_add(1);
+                            next_seq = first_seq;
+                            // Output all contiguous packets from new position
+                            while let Some(data) = output_queue.remove(&next_seq) {
+                                if write_tx.send(data).is_err() {
+                                    return;
+                                }
+                                next_seq = next_seq.wrapping_add(1);
+                                last_output_time = std::time::Instant::now();
+                            }
                         }
                     }
+                }
+            }
+        }
+
+        // Flush remaining packets when channel closes
+        if !output_queue.is_empty() {
+            eprintln!(
+                "INFO: Channel closed, flushing {} remaining packets",
+                output_queue.len()
+            );
+            while !output_queue.is_empty() {
+                if let Some(&first_seq) = output_queue.keys().next() {
+                    let gap = first_seq.wrapping_sub(next_seq);
+                    if gap < 32768 && gap > 0 {
+                        next_seq = first_seq;
+                    }
+                    while let Some(data) = output_queue.remove(&next_seq) {
+                        if write_tx.send(data).is_err() {
+                            return;
+                        }
+                        next_seq = next_seq.wrapping_add(1);
+                    }
+                } else {
+                    break;
                 }
             }
         }
@@ -508,11 +749,11 @@ async fn run_receiver(
     let mut parity_count = 0u64;
     let mut recovered_count = 0u64;
     let start_time = std::time::Instant::now();
+    let mut last_ack_time = std::time::Instant::now();
+    const PERIODIC_ACK_INTERVAL_MS: u64 = 50; // Send ACK at least every 50ms
 
     // Process the first packet that we already received
-    // Parse the reliable transport header (8 bytes) and extract payload
     if first_len >= 8 {
-        // Header: seq (2) + type (1) + reserved (5) = 8 bytes
         let seq = u16::from_le_bytes([first_buf[0], first_buf[1]]);
         let pkt_type = first_buf[2];
 
@@ -522,13 +763,13 @@ async fn run_receiver(
             debug!("Injected first packet: seq={}, len={}", seq, payload.len());
             source_count += 1;
 
-            // Also add to FEC decoder for recovery purposes
+            // Add to FEC decoder for recovery purposes
             let mut padded = payload.clone();
             if padded.len() < packet_size {
                 padded.resize(packet_size, 0);
             }
-            decoder.fec_mut().add_source(seq, &padded);
-            decoder.arq_mut().on_receive(seq);
+            session.fec_decoder_mut().add_source(seq, &padded);
+            session.receiver_arq_mut().on_receive(seq);
 
             if output_tx.try_send((seq, payload)).is_err() {
                 warn!("Output buffer full, dropping first packet");
@@ -537,14 +778,19 @@ async fn run_receiver(
     }
 
     loop {
-        let result = decoder.recv().await;
+        // Use timeout to allow periodic ACKs even when no data arrives
+        let recv_result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(PERIODIC_ACK_INTERVAL_MS),
+            session.recv(),
+        )
+        .await;
 
-        match result {
-            Ok(RecvResult::Source {
+        match recv_result {
+            Ok(Ok(RecvResult::Source {
                 seq,
                 data,
                 recovered,
-            }) => {
+            })) => {
                 source_count += 1;
                 if recovered {
                     recovered_count += 1;
@@ -556,22 +802,34 @@ async fn run_receiver(
                 if output_tx.try_send((seq, data)).is_err() {
                     warn!("Output buffer full, dropping packet {}", seq);
                 }
+                last_ack_time = std::time::Instant::now();
             }
-            Ok(RecvResult::Parity) => {
+            Ok(Ok(RecvResult::Parity)) => {
                 parity_count += 1;
                 debug!("Received parity packet");
+                last_ack_time = std::time::Instant::now();
             }
-            Ok(RecvResult::Ack) => {
-                // Shouldn't happen on receiver side
-                debug!("Received ACK (unexpected)");
+            Ok(Ok(RecvResult::Ack)) => {
+                debug!("Received ACK (unexpected on receiver)");
             }
-            Ok(RecvResult::WouldBlock) => {
-                // Non-blocking mode returned no packet
+            Ok(Ok(RecvResult::WouldBlock)) => {
                 tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Receive error: {}", e);
                 continue;
+            }
+            Err(_) => {
+                // Timeout - send periodic ACK if we have pending data
+                if last_ack_time.elapsed().as_millis() >= PERIODIC_ACK_INTERVAL_MS as u128 {
+                    if session.receiver_arq().packets_since_ack() > 0 {
+                        debug!("Sending periodic ACK");
+                        if let Err(e) = session.force_ack().await {
+                            warn!("Failed to send periodic ACK: {}", e);
+                        }
+                        last_ack_time = std::time::Instant::now();
+                    }
+                }
             }
         }
 
